@@ -1,0 +1,1637 @@
+// ---- FX Types ----
+enum FXType { FX_REVERB, FX_BITCRUSH, FX_LOWPASS, FX_COUNT };
+FXType currentFX = FX_REVERB;
+float reverbDepth = 0.3f;
+float bitcrushDepth = 0.3f;
+float lowpassDepth = 0.3f;
+// ---- Mode Handling ----
+enum UIMode { MODE_RAM, MODE_SDREC, MODE_MENU, MODE_EFFECTS_MENU };
+UIMode uiMode = MODE_RAM;
+
+// ---- Gains ----
+float usbGain = 1.0f;
+float lineInGain = 0.0f;
+
+// ---- Includes ----
+#include <cstdint>
+#include <cstdint>
+#include <Arduino.h>
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SdFat.h>
+#include <malloc.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1351.h>
+#include "BetterButton.h"
+#include <SD.h>          
+#define SD_CS 10         
+
+
+#include "status.h"
+#include "functions.h"
+
+/* ---- OLED ---- */
+#define OLED_CS   26
+#define OLED_DC   27
+#define OLED_RST   9
+Adafruit_SSD1351 tft(128, 128, &SPI, OLED_CS, OLED_DC, OLED_RST);
+#define BLACK 0x0000
+#define WHITE 0xFFFF
+#define RED   0xF800
+#define GREEN 0x07E0
+#define BLUE  0x001F
+#define YELLOW 0xFFE0
+#define CYAN  0x07FF
+#define GRAY  0x8410
+
+/* ---- Audio graph ---- */
+// AudioInputUSB usbIn; // USB input disabled
+AudioInputI2S      lineIn;      
+AudioMixer4         inputMix;    
+AudioFilterBiquad   hp;          
+AudioRecordQueue    recQ;        // mono record tap (filtered L)
+AudioRecordQueue&   recordQueue = recQ;
+AudioPlayQueue      playQ;       // mono playback (RAM loop)
+AudioPlayQueue&     playbackQueue = playQ;
+AudioPlaySdWav      playSd1;     // SD voice 1
+AudioPlaySdWav&     sdPlayer1 = playSd1;
+AudioPlaySdWav      playSd2;     // SD voice 2
+AudioPlaySdWav&     sdPlayer2 = playSd2;
+AudioMixer4         polyMix;     // mixes SD voices
+AudioMixer4&        sdPolyMixer = polyMix;
+AudioMixer4         mix;        
+AudioMixer4&        mainMixer = mix; 
+bool sdPolyPlaying = false;      // true when poly is active
+bool sdPolyMode = true;         // true enables polyphonic SD mode
+AudioEffectFreeverb reverb;
+AudioEffectBitcrusher bitcrushFX;
+AudioFilterBiquad lowpassFX;
+AudioOutputI2S      i2sOut;      
+AudioAnalyzePeak    peakL;       // input level meter
+AudioControlSGTL5000 sgtl5000;
+
+// wiring
+// AudioConnection pc0(usbIn, 0, inputMix, 0); // USB to inputMix channel 0 (disabled)
+AudioConnection pc0b(lineIn, 0, inputMix, 1);  // Line-in to inputMix channel 1
+AudioConnection pc1(inputMix, 0, hp, 0);       // inputMix output to highpass
+AudioConnection pc2(hp,    0, recordQueue, 0);
+AudioConnection pc3(hp,    0, mix,  0);   // dry path
+AudioConnection pc4(playbackQueue, 0, mix,  1);   // RAM loop path
+// SD poly voices
+AudioConnection pcSd1(playSd1, 0, polyMix, 0);
+AudioConnection pcSd2(playSd2, 0, polyMix, 1);
+AudioConnection pcPolyMix(polyMix, 0, mix, 2); // SD poly mix to main mix (channel 2)
+// AudioConnection pc5(mix,   0, bitcrushFX, 0); // bypassed
+// AudioConnection pcBitcrushToReverb(bitcrushFX, 0, reverb, 0); // bypassed
+AudioConnection pcMixToReverb(mix, 0, reverb, 0); // direct connection
+AudioConnection pc6(reverb,0, lowpassFX, 0);
+AudioConnection pc7(lowpassFX,0, i2sOut, 0);
+AudioConnection pc7b(lowpassFX,0, i2sOut, 1);
+AudioConnection pc8(inputMix, 0, peakL, 0);    
+
+// --- Polyphonic SD playback ---
+void startSDPolyPlay(const char* path1, const char* path2) {
+  // Queued SD playback is stopped
+  stopSDPlay();
+  // Stop voices
+  playSd1.stop();
+  playSd2.stop();
+  sdPolyPlaying = true;
+  polyMix.gain(0, 1.0f); // voice 1
+  polyMix.gain(1, 1.0f); // voice 2
+  polyMix.gain(2, 0.0f); // future use
+  polyMix.gain(3, 0.0f); // future use
+  // Mute dry and RAM loop
+  mix.gain(0, 0.0f); // dry muted
+  mix.gain(1, 0.0f); // RAM loop muted
+  mix.gain(2, 1.0f); // SD poly mix to main mix
+  delay(10);
+  playSd1.play(path1);
+  playSd2.play(path2);
+}
+
+void stopSDPolyPlay() {
+  if (!sdPolyPlaying) return;
+  playSd1.stop();
+  playSd2.stop();
+  sdPolyPlaying = false;
+  // restore mix routing
+  mix.gain(0, 1.0f);
+  mix.gain(1, 0.8f);
+  mix.gain(2, 0.0f);
+}
+
+/* ---- Pins ---- */
+const int buttonPins[7] = {33, 34, 35, 36, 37, 32, 30}; 
+const int POT_FX = A10;
+const int POT_VOL = A14;
+
+// Optional input switch pin; can be overridden elsewhere
+#ifndef INPUT_SWITCH_PIN
+#define INPUT_SWITCH_PIN 31
+#endif
+
+BetterButton button1(buttonPins[0], 0, INPUT_PULLUP); // Record
+BetterButton button2(buttonPins[1], 1, INPUT_PULLUP); // Play
+BetterButton button3(buttonPins[2], 2, INPUT_PULLUP); // Stop
+BetterButton button4(buttonPins[3], 3, INPUT_PULLUP); // Delete
+BetterButton button5(buttonPins[4], 4, INPUT_PULLUP); // SD Mode
+BetterButton menuBtnUp(buttonPins[5], 5, INPUT_PULLUP); // Menu Up
+BetterButton menuBtnDown(buttonPins[6], 6, INPUT_PULLUP); // Menu Down
+
+BetterButton* buttonArray[7] = { &button1, &button2, &button3, &button4, &button5, &menuBtnUp, &menuBtnDown };
+
+/* ---- Loop buffer ---- */
+const int BLOCK_SAMPLES = 128;        
+const int MAX_BLOCKS    = 700;  
+int sdRecMaxBlocks = 4000;  // adjustable for SDREC mode
+
+DMAMEM __attribute__((aligned(32)))
+int16_t loopBuffer[MAX_BLOCKS][BLOCK_SAMPLES];
+volatile int blocksRecorded = 0;
+// total number of recorded blocks in RAM or SD
+volatile int& recordedBlockCount = blocksRecorded;
+static int loopPlayIndex = 0;
+// current playback block index
+static int& playbackBlockIndex = loopPlayIndex;
+int16_t waveformPeak = 512;     
+float   waveformGain = 1.0f;   
+
+bool isRecording   = false;
+bool isPlaying     = false;
+bool armedRecord   = false;    
+bool& recordingState = isRecording;
+bool& playingState = isPlaying;
+bool& armedState = armedRecord;
+const float ARM_LEVEL_THRESHOLD = 0.02f;
+
+// ---- Looper state (add) ----
+bool loopCaptured = false;     // true after first loop is created
+bool overdubEnabled = false;   // toggle to layer on top of the loop
+float odInputGain = 0.8f;      // live input level into overdub
+float odFeedback  = 0.7f;      // how much of the existing loop remains
+
+// ---- WAV Writer state ----
+File wavFile;
+volatile uint32_t samplesWritten = 0;    
+bool isSDRecording = false; 
+
+// Playback source: false = RAM, true = SD
+bool playFromSD = false; 
+uint32_t sdBlocksToPlay = 0; 
+
+// ---- WAV Reader (double-buffered) ----
+File playFile; 
+const uint32_t BUF_SAMPLES = 4096;       
+DMAMEM int16_t sdBufA[BUF_SAMPLES];
+DMAMEM int16_t sdBufB[BUF_SAMPLES];
+volatile uint32_t rdIndexA = 0, validA = 0;
+volatile uint32_t rdIndexB = 0, validB = 0; 
+volatile bool bufAReady = false, bufBReady = false;
+// Aliases for clearer usage
+volatile uint32_t& sdReadIndexA = rdIndexA;
+volatile uint32_t& sdValidSamplesA = validA;
+volatile uint32_t& sdReadIndexB = rdIndexB;
+volatile uint32_t& sdValidSamplesB = validB;
+volatile bool& sdBufferAReady = bufAReady;
+volatile bool& sdBufferBReady = bufBReady;
+bool useA = true;                         
+bool sdPlaying = false;
+bool& sdPlaybackActive = sdPlaying;
+
+// ---- Clip indicators ----
+const int CLIP_LED_PIN = 2;               
+AudioAnalyzePeak peakOut;                 
+bool clipLatched = false;                
+AudioConnection pcOutMeter(reverb, 0, peakOut, 0);
+
+
+/* ---- UI ---- */
+Status current = ST_READY, lastDrawn = (Status)255;
+
+
+void drawStatus(Status s);
+
+
+// ---- SD Menu System ----
+#define MAX_MENU_ITEMS 32
+char menuItems[MAX_MENU_ITEMS][32]; 
+int menuLength = 0;
+int menuIndex = 0;
+String currentPath = "/";
+
+// --- Playback & Menu screen state ---
+FXType sdPlayFX = FX_REVERB;
+bool sdPlayFXEnabled[FX_COUNT] = {true, true, true};
+float sdPlayFXDepth[FX_COUNT] = {0.3f, 0.3f, 0.3f};
+bool inEffectsMenu = false;
+int effectsMenuIndex = 0;
+const char* effectsMenuItems[FX_COUNT] = { "Reverb", "Bitcrush", "Lowpass" };
+bool inPlaybackScreen = false;
+String playbackFile = "";
+
+// --- Playback screen drawing ---
+void drawPlaybackScreen() {
+  tft.fillRect(0, 20, 128, 108, BLACK);
+  tft.setTextColor(GREEN); tft.setCursor(4, 22);
+  tft.print("Playing: "); tft.print(playbackFile);
+  // Waveform preview reenable later
+  /*
+  File f = SD.open(playbackFile.c_str(), FILE_READ);
+  if (f && f.size() > 44) {
+    f.seek(44);
+    const int previewSamples = 1024; // smaller to be safe
+    int16_t *buf = (int16_t*)extmem_malloc(previewSamples * sizeof(int16_t));
+    if (buf) {
+      int n = f.read((uint8_t*)buf, previewSamples * 2);
+      if (n > 0) {
+        n = n / 2;
+        for (int i = n; i < previewSamples; ++i) buf[i] = 0;
+        int16_t peak = 256;
+        for (int i = 0; i < n; ++i) {
+          int16_t s = abs(buf[i]);
+          if (s > peak) peak = s;
+        }
+        if (peak < 1) peak = 1;
+        for (int x = 0; x < 128; ++x) {
+          int idx = x * n / 128;
+          if (idx >= n) idx = n - 1;
+          int16_t s = buf[idx];
+          float norm = (float)s / (float)peak;
+          int y0 = 60;
+          int y1 = y0 - (int)(norm * 35.0f);
+          if (y1 < 20) y1 = 20;
+          if (y1 > 90) y1 = 90;
+          tft.drawFastVLine(x, min(y0, y1), abs(y1 - y0) + 1, CYAN);
+        }
+      }
+      extmem_free(buf);
+    }
+    f.close();
+  }
+  */
+
+  tft.setTextColor(YELLOW); tft.setCursor(4, 110);
+  tft.print("Menu Up/Down to exit");
+}
+
+void scanSDMenu(const String& path) {
+  menuLength = 0;
+  File dir = SD.open(path.c_str());
+  if (!dir) {
+    strcpy(menuItems[0], "<SD Error>");
+    menuLength = 1;
+    return;
+  }
+  File entry;
+  while ((entry = dir.openNextFile())) {
+    if (menuLength >= MAX_MENU_ITEMS) break;
+    String name = entry.name();
+    if (entry.isDirectory()) name += "/";
+    strncpy(menuItems[menuLength], name.c_str(), 31);
+    menuItems[menuLength][31] = '\0';
+    menuLength++;
+    entry.close();
+  }
+  dir.close();
+  if (menuLength == 0) {
+    strcpy(menuItems[0], "<Empty>");
+    menuLength = 1;
+  }
+  menuIndex = 0;
+}
+
+void drawMenu() {
+  tft.fillRect(0, 20, 128, 108, BLACK); 
+  const int visibleRows = 6; // Number of items visible at once
+  int y = 24;
+  // Infinite scrolling
+  for (int i = 0; i < visibleRows; i++) {
+    int menuIdx = menuIndex + i - visibleRows/2;
+    if (menuIdx < 0 || menuIdx >= menuLength) continue;
+    if (menuIdx == menuIndex) {
+      tft.fillRect(0, y-2, 128, 14, BLUE); 
+      tft.setTextColor(WHITE, BLUE);
+    } else {
+      tft.setTextColor(WHITE, BLACK);
+    }
+    tft.setCursor(4, y);
+    tft.print(menuItems[menuIdx]);
+    y += 16;
+  }
+
+  // Clear preview area first
+  tft.fillRect(0, 96, 128, 32, BLACK);
+  String sel = String(menuItems[menuIndex]);
+  // Show preview for .WAV files, not folders
+  if (!sel.endsWith("/") && sel.endsWith(".WAV")) {
+    String fullPath = currentPath + sel;
+    File f = SD.open(fullPath.c_str(), FILE_READ);
+    if (f && f.size() > 44) {
+      f.seek(44); // skip WAV header
+      const int previewSamples = 1024;
+      int16_t *buf = (int16_t*)extmem_malloc(previewSamples * sizeof(int16_t));
+      if (!buf) {
+        f.close();
+      } else {
+        int n = f.read((uint8_t*)buf, previewSamples * 2);
+        if (n > 0) {
+          n = n / 2; 
+          for (int i = n; i < previewSamples; ++i) buf[i] = 0;
+          // Find peak for scaling 
+          int16_t peak = 256;
+          for (int i = 0; i < n; ++i) {
+            int16_t s = abs(buf[i]);
+            if (s > peak) peak = s;
+          }
+          if (peak < 1) peak = 1;
+          // Draw waveform
+          for (int x = 0; x < 128; ++x) {
+            int sampleIndex = x * n / 128;
+            if (sampleIndex >= n) sampleIndex = n - 1;
+            int16_t s = buf[sampleIndex];
+            float norm = (float)s / (float)peak;
+            int y0 = 112;
+            int y1 = y0 - (int)(norm * 15.0f);
+            if (y1 < 96) y1 = 96;
+            if (y1 > 127) y1 = 127;
+            tft.drawFastVLine(x, min(y0, y1), abs(y1 - y0) + 1, CYAN);
+          }
+        }
+        f.close();
+        extmem_free(buf);
+      }
+    }
+  }
+}
+
+void drawEffectsMenu() {
+  tft.fillRect(0, 20, 128, 108, BLACK); 
+  tft.setTextColor(YELLOW); tft.setCursor(4, 22);
+  tft.print("Effects");
+  int y = 40;
+  for (int i = 0; i < FX_COUNT; ++i) {
+    if (i == effectsMenuIndex) {
+      tft.fillRect(0, y-2, 64, 14, BLUE); 
+      tft.setTextColor(WHITE, BLUE);
+    } else {
+      tft.setTextColor(WHITE, BLACK);
+    }
+    tft.setCursor(4, y);
+    tft.print(effectsMenuItems[i]);
+    y += 16;
+  }
+  tft.setTextColor(sdPlayFXEnabled[effectsMenuIndex] ? GREEN : RED);
+  tft.setCursor(4, 100);
+  tft.print(sdPlayFXEnabled[effectsMenuIndex] ? "Enabled" : "Disabled");
+
+
+  // Draw effect visual
+  tft.fillRect(64, 24, 64, 72, BLACK); 
+  float potVal = analogRead(POT_FX) / 1023.0f;
+  switch (effectsMenuIndex) {
+    case FX_REVERB: {
+      int knobCenterX = 64 + 32, knobCenterY = 60, knobRadius = 20;
+  tft.drawCircle(knobCenterX, knobCenterY, knobRadius, GRAY);
+  float angle = 3.14159f * (0.75f + 1.5f * potVal); // 135° to 405°
+  int knobHandleX = knobCenterX + (int)(knobRadius * cos(angle));
+  int knobHandleY = knobCenterY + (int)(knobRadius * sin(angle));
+  tft.drawLine(knobCenterX, knobCenterY, knobHandleX, knobHandleY, CYAN);
+  tft.setTextColor(CYAN); tft.setCursor(knobCenterX-20, knobCenterY+36);
+  tft.print("Depth: "); tft.print(potVal,2);
+      break;
+    }
+    case FX_BITCRUSH: {
+      int bars = 8 + (int)(potVal * 8.0f);
+      int barX = 68, barY = 40;
+      for (int barIdx = 0; barIdx < 16; ++barIdx) {
+        int barHeight = 4 + barIdx;
+        uint16_t col = (barIdx < bars) ? CYAN : GRAY;
+        tft.fillRect(barX + barIdx*3, barY + 32 - barHeight, 2, barHeight, col);
+      }
+      tft.setTextColor(CYAN); tft.setCursor(barX, barY+48);
+      tft.print("Bits: "); tft.print(bars);
+      break;
+    }
+    case FX_LOWPASS: {
+  int curveBaseY = 90, curveWidth = 56, curveHeight = 24;
+      float cutoff = 12000.0f - potVal * (12000.0f - 500.0f);
+      for (int curveX = 0; curveX < curveWidth; ++curveX) {
+        float freq = 500.0f + (curveX/(float)curveWidth)*(12000.0f-500.0f);
+        float curveY = curveHeight * exp(-freq/cutoff);
+        tft.drawPixel(64 + curveX, curveBaseY - (int)curveY, CYAN);
+      }
+    tft.setTextColor(CYAN); tft.setCursor(66, curveBaseY+16);
+      tft.print("Cutoff: "); tft.print((int)cutoff);
+      break;
+    }
+    default: break;
+  }
+}
+
+// Applies current selected FX parameters immediately
+void applyEffectsNow() {
+  FXType fx = sdPlayFX;
+  float fxDepth = sdPlayFXDepth[fx];
+  bool fxEnabled = sdPlayFXEnabled[fx];
+  switch (fx) {
+    case FX_REVERB:
+      reverb.roomsize(fxEnabled ? (fxDepth > 0.01f ? fxDepth * 0.95f : 0.01f) : 0.01f);
+      break;
+    case FX_BITCRUSH:
+      break;
+    case FX_LOWPASS: {
+      float minCutoff = 500.0f;
+      float maxCutoff = 12000.0f;
+      float cutoff = fxEnabled ? (maxCutoff - fxDepth * (maxCutoff - minCutoff)) : maxCutoff;
+      if (fxDepth < 0.01f || !fxEnabled) cutoff = maxCutoff;
+      lowpassFX.setLowpass(0, cutoff, 0.707f);
+      break;
+    }
+    default: break;
+  }
+
+  if (playFromSD && sdPlaying) {
+    mix.gain(0, 0.0f); 
+    mix.gain(1, 0.0f); 
+    mix.gain(2, 1.0f); 
+  }
+}
+
+void drawHeader(){
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  tft.fillScreen(BLACK);
+  tft.setTextColor(WHITE); tft.setTextSize(1);
+  tft.setCursor(4,4); tft.println("USB Looper");
+  tft.drawLine(0,16,127,16,GRAY);
+  // Shows mode in header area
+  tft.setTextColor(YELLOW);
+  tft.setCursor(80, 4);
+  switch (uiMode) {
+  case MODE_RAM:   tft.print("RAM Rec"); break;
+  case MODE_SDREC: tft.print("SD Rec"); break;
+  case MODE_MENU:  tft.print("MENU");   break;
+  case MODE_EFFECTS_MENU: tft.print("FX Menu"); break;
+  default: break;
+}
+  tft.setTextColor(playFromSD ? CYAN : YELLOW);
+  tft.setCursor(80, 12); tft.print(playFromSD ? "SDPlay" : "RAMPlay");
+  SPI.endTransaction();
+}
+void drawStatus(Status s){
+  if (s == lastDrawn) return;
+  lastDrawn = s;
+  tft.fillRect(0,20,128,18,BLACK); tft.setCursor(4,22);
+  switch(s){
+    case ST_READY:     tft.setTextColor(WHITE);  tft.print("Status: Ready"); break;
+    case ST_ARMED:     tft.setTextColor(YELLOW); tft.print("Status: Armed (waiting)"); break;
+    case ST_RECORDING: tft.setTextColor(GREEN);  tft.print("Status: Recording..."); break;
+    case ST_RECORDED:  tft.setTextColor(YELLOW); tft.print("Status: Recorded"); break;
+    case ST_PLAYING:   tft.setTextColor(GREEN);  tft.print("Status: Playing..."); break;
+    case ST_STOPPED:   tft.setTextColor(WHITE);  tft.print("Status: Stopped"); break;
+    case ST_NOAUDIO:   tft.setTextColor(RED);    tft.print("Status: No audio"); break;
+    case ST_TOOQUIET:  tft.setTextColor(RED);    tft.print("Status: Too quiet"); break;
+  }
+}
+void drawFX(float depth, float vol){
+  tft.fillRect(0,40,128,20,BLACK);
+  tft.setCursor(4,42);
+  tft.setTextColor(CYAN);
+  float d = 0.0f;
+  switch (currentFX) {
+    case FX_REVERB:
+      d = reverbDepth;
+      tft.print("Reverb: "); tft.print(d,2);
+      break;
+    case FX_BITCRUSH:
+      d = bitcrushDepth;
+      tft.print("Bitcrush: "); tft.print(d,2);
+      break;
+    case FX_LOWPASS:
+      d = lowpassDepth;
+      tft.print("Lowpass: "); tft.print(d,2);
+      break;
+    default:
+      break;
+  }
+  tft.setCursor(4,54);
+  tft.setTextColor(YELLOW); tft.print("Volume: "); tft.print(vol,2);
+}
+void drawCounts(int n){
+  tft.fillRect(0,62,128,18,BLACK);
+  tft.setCursor(4,64);
+  tft.setTextColor(YELLOW);
+  float seconds = (n * (float)BLOCK_SAMPLES) / 44100.0f;
+  tft.print("Blocks: "); tft.print(n);
+  tft.print("  ("); tft.print(seconds, 2); tft.print("s)");
+}
+void drawMeter(float p){
+  int w = (int)(constrain(p,0.0f,1.0f)*127.0f);
+  tft.fillRect(0,84,w,6,GREEN);
+  tft.fillRect(w,84,127-w,6,BLACK);
+}
+
+
+inline int sampleToY(int16_t sample) {
+  float normalized = (float)sample / (float)waveformPeak;   // roughly -1..1
+  int centerY = 104;
+  int mappedY = centerY - (int)(normalized * 20.0f);   // ±20 px
+  if (mappedY < 64) mappedY = 64;
+  if (mappedY > 128) mappedY = 128;
+  return mappedY;
+}
+
+void drawWaveform() {
+  tft.fillRect(0, 96, 128, 32, BLACK);
+  if (blocksRecorded <= 0) return;
+
+  const uint32_t totalSamples = (uint32_t)blocksRecorded * BLOCK_SAMPLES;
+  for (int x = 0; x < 128; x++) {
+    uint32_t sampleIndex = (uint32_t)x * totalSamples / 128;
+    uint32_t blockIndex = sampleIndex / BLOCK_SAMPLES;
+    uint32_t offsetInBlock = sampleIndex % BLOCK_SAMPLES;
+    if (blockIndex >= (uint32_t)blocksRecorded) blockIndex = blocksRecorded - 1;
+
+    int16_t s = loopBuffer[blockIndex][offsetInBlock];
+    int y = sampleToY(s);
+  int lineTop = 104;
+  int lineBottom = y;
+  if (lineBottom < lineTop) { int tmpSwap = lineTop; lineTop = lineBottom; lineBottom = tmpSwap; }
+  tft.drawFastVLine(x, lineTop, lineBottom - lineTop + 1, CYAN);
+  }
+}
+
+/* ---- Fade out Logic ---- */
+void applyFadeInOut() {
+  if (blocksRecorded <= 0) return;
+  const int fadeN = min(64, BLOCK_SAMPLES);
+  if (fadeN <= 1) {
+    // Short buffers: ensure start and end samples are zero
+    loopBuffer[0][0] = 0;
+    int lastBlockIndex_local = blocksRecorded - 1;
+    loopBuffer[lastBlockIndex_local][BLOCK_SAMPLES - 1] = 0;
+    return;
+  }
+
+  // Fade-in on first block using Hann window
+  for (int fadePos = 0; fadePos < fadeN; ++fadePos) {
+    float win = 0.5f * (1.0f - cosf(M_PI * (float)fadePos / (float)(fadeN - 1)));
+    int32_t sampleVal = loopBuffer[0][fadePos];
+    sampleVal = (int32_t)(sampleVal * win);
+    loopBuffer[0][fadePos] = (int16_t)sampleVal;
+  }
+
+  int lastBlockIndex = blocksRecorded - 1;
+  // Fade-out on last block using complementary Hann window
+  for (int fadePos = 0; fadePos < fadeN; ++fadePos) {
+    float win = 0.5f * (1.0f - cosf(M_PI * (float)fadePos / (float)(fadeN - 1)));
+    float gain = 1.0f - win;
+    int fadeIndex = BLOCK_SAMPLES - fadeN + fadePos;
+    if (fadeIndex < 0) fadeIndex = 0;
+    int32_t sampleVal = loopBuffer[lastBlockIndex][fadeIndex];
+    sampleVal = (int32_t)(sampleVal * gain);
+    loopBuffer[lastBlockIndex][fadeIndex] = (int16_t)sampleVal;
+  }
+  int lastBlockFinal = blocksRecorded - 1;
+  loopBuffer[lastBlockFinal][BLOCK_SAMPLES - 1] = 0;
+}
+
+// Smoothly crossfade the end of the recorded loop into its beginning
+// to reduce a click when playback wraps. Uses descriptive names and
+// clamps the result to int16 range.
+void smoothLoopWrap() {
+  if (blocksRecorded <= 1) return;
+  const int CROSSFADE_SAMPLES = min(32, BLOCK_SAMPLES);
+  const int firstBlockIndex = 0;
+  const int lastBlockIndex = blocksRecorded - 1;
+  const int fadeCount = CROSSFADE_SAMPLES;
+
+  for (int sample = 0; sample < fadeCount; ++sample) {
+    // mix parameter 0..1 where 0 -> only last block, 1 -> only first block
+    float mixT = (float)sample / (float)(fadeCount - 1);
+    float gainFirst = mixT;          // ramps up
+    float gainLast  = 1.0f - mixT;   // ramps down
+
+    int lastSampleIndex = BLOCK_SAMPLES - fadeCount + sample;
+
+    int32_t lastVal  = (int32_t)loopBuffer[lastBlockIndex][lastSampleIndex];
+    int32_t firstVal = (int32_t)loopBuffer[firstBlockIndex][sample];
+
+    int32_t mixed = (int32_t)(lastVal * gainLast + firstVal * gainFirst);
+
+    // clamp to int16_t range
+    if (mixed > 32767) mixed = 32767;
+    else if (mixed < -32768) mixed = -32768;
+
+    loopBuffer[lastBlockIndex][lastSampleIndex] = (int16_t)mixed;
+  }
+}
+
+/* ---- Recording/Playback Control ---- */
+void startArmedRecord(){
+  isPlaying = false;
+  isRecording = false;
+  armedRecord = true;
+  recordQueue.clear();
+  if (!isSDRecording) {
+    blocksRecorded = 0;
+    memset(loopBuffer, 0, sizeof(loopBuffer));
+  playbackBlockIndex = 0;
+  }
+  if (isSDRecording) {
+  mainMixer.gain(0, 0.0f); 
+  } else {
+  mainMixer.gain(0, 1.0f); 
+  }
+  recordQueue.begin();      
+  current = ST_ARMED; drawStatus(current);
+}
+
+
+// Find next available ###.WAV 
+String nextRecFilename() {
+  int recIndex = 1;
+  char fnameBuf[16];
+  while (recIndex < 1000) {
+    snprintf(fnameBuf, sizeof(fnameBuf), "/REC%03d.WAV", recIndex);
+    if (!SD.exists(fnameBuf)) return String(fnameBuf);
+    recIndex++;
+  }
+  return String("/REC999.WAV");
+}
+
+void startSDRecord(const char* path) {
+  if (!isSDRecording) return; 
+  wavFile = SD.open(path, FILE_WRITE);
+  if (wavFile) {
+    writeWavHeader(wavFile, 44100, 16, 1);
+    samplesWritten = 0;
+  }
+}
+
+void stopSDRecord() {
+  if (!isSDRecording || !wavFile) return;
+  patchWavSizes(wavFile, samplesWritten * 2);
+  wavFile.close();
+}
+
+void startRecordingNow(){
+  isRecording = true;
+  armedRecord = false;
+  current = ST_RECORDING; drawStatus(current);
+  if (isSDRecording) {
+    mix.gain(0, 0.0f); 
+    static String lastRecFile = "";
+    lastRecFile = nextRecFilename();
+    startSDRecord(lastRecFile.c_str());
+    // Display filename above SD Blocks
+    tft.fillRect(0, 96, 128, 12, BLACK); 
+    tft.setCursor(4, 98);
+    tft.setTextColor(CYAN);
+    tft.print("Rec: ");
+    tft.print(lastRecFile);
+  } else {
+    // RAM mode: clear buffer and reset
+    mix.gain(0, 1.0f); 
+    blocksRecorded = 0;
+    loopPlayIndex = 0;
+    memset(loopBuffer, 0, sizeof(loopBuffer));
+  }
+}
+
+void stopRecording() {
+  if (!(isRecording || armedRecord)) return;
+  recordQueue.end();
+  stopSDRecord();
+  isRecording = false;
+  armedRecord = false;
+  mix.gain(0, 1.0f);
+  bool hadAudio = (blocksRecorded > 0);
+  if (!isSDRecording && hadAudio) {
+    applyFadeInOut();
+    int16_t m = 0;
+    for (int b = 0; b < blocksRecorded; ++b) {
+      for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+        int16_t s = abs(loopBuffer[b][i]);
+        if (s > m) m = s;
+      }
+    }
+    waveformPeak = max((int16_t)m, (int16_t)256);     
+    waveformGain = 20.0f / (waveformPeak / 32768.0f); 
+    current = ST_RECORDED;
+  } else if (isSDRecording && hadAudio) {
+    current = ST_RECORDED;
+  } else {
+    current = ST_NOAUDIO;
+  }
+  drawStatus(current);
+}
+
+
+void startPlayback(){
+  if (blocksRecorded <= 0) { current = ST_NOAUDIO; drawStatus(current); return; }
+  loopPlayIndex = 0;
+  isPlaying = true;
+  current = ST_PLAYING; drawStatus(current);
+  mix.gain(0, 0.0f); 
+}
+
+void stopPlayback(){
+  isPlaying = false;
+  stopSDPlay();
+  sdPolyPlaying = false;
+  current = ST_STOPPED; drawStatus(current);
+  // Always restore dry/live when idle
+  mix.gain(0, 1.0f); // dry/live restored
+  mix.gain(1, 0.8f); // loop path back to default
+  mix.gain(2, 0.0f); // SD poly mix muted
+}
+
+// SD playback loop logic 
+void handleSDPlaybackLoop() {
+  if (playFromSD && sdPlaying && playFile) {
+    if (playFile.available() == 0) {
+      // End of file
+      playFile.seek(44);
+    }
+  }
+}
+
+void startSDPlay(const char* path) {
+  if (sdPlaying) return;
+  if (isRecording || armedRecord) stopRecording();
+  if (wavFile) stopSDRecord();
+  mix.gain(0, 0.0f); // dry muted
+  mix.gain(1, 1.0f); // loop path full volume
+  playFile = SD.open(path, FILE_READ);
+  if (!playFile) {
+    Serial.println("SD: Could not open file for playback");
+    sdPlaying = false;
+    playFromSD = false;
+    return;
+  }
+  if (playFile.size() <= 44) {
+    Serial.println("SD: File too small or not a valid WAV");
+    playFile.close();
+    sdPlaying = false;
+    playFromSD = false;
+    return;
+  }
+  playFile.seek(44); // skip WAV header
+
+  // Set sdBlocksToPlay to file size in blocks
+  uint32_t dataBytes = playFile.size() - 44;
+  sdBlocksToPlay = dataBytes / (BLOCK_SAMPLES * sizeof(int16_t));
+  if (sdBlocksToPlay < 1) sdBlocksToPlay = 1;
+  loopPlayIndex = 0;
+
+  // reset buffers
+  rdIndexA = rdIndexB = 0;
+  validA = validB = 0;
+  bufAReady = bufBReady = false;
+  useA = true;
+  sdPlaying = true;
+  playFromSD = true;
+  Serial.print("SD: Playing file, blocks=");
+  Serial.println(sdBlocksToPlay);
+}
+
+void stopSDPlay() {
+  if (!sdPlaying) return;
+  playFile.close();
+  sdPlaying = false;
+  playFromSD = false;
+  sdPolyPlaying = false;
+  mix.gain(0, 1.0f); // dry/live restored
+  mix.gain(1, 0.8f); // loop path back to default
+  mix.gain(2, 0.0f); // SD poly mix muted
+}
+
+// ---- Delete sample ----
+void deleteSample() {
+  isRecording = false;
+  isPlaying = false;
+  armedRecord = false;
+  stopSDRecord();
+  stopSDPlay();
+  blocksRecorded = 0;
+  loopPlayIndex = 0;
+  memset(loopBuffer, 0, sizeof(loopBuffer));
+  mix.gain(0, 1.0f); 
+  current = ST_READY;
+  drawStatus(current);
+  drawCounts(0);
+  // Clear waveform area
+  tft.fillRect(0, 96, 128, 32, BLACK);
+}
+
+
+void writeWavHeader(File &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+  uint8_t hdr[44];
+  uint32_t byteRate = sampleRate * channels * (bitsPerSample/8);
+  uint16_t blockAlign = channels * (bitsPerSample/8);
+  // RIFF chunk
+  memcpy(hdr+0,  "RIFF", 4);
+  *(uint32_t*)(hdr+4)  = 0;                 // placeholder file size-8
+  memcpy(hdr+8,  "WAVE", 4);
+  // fmt chunk
+  memcpy(hdr+12, "fmt ", 4);
+  *(uint32_t*)(hdr+16) = 16;                // PCM header size
+  *(uint16_t*)(hdr+20) = 1;                 // PCM format
+  *(uint16_t*)(hdr+22) = channels;
+  *(uint32_t*)(hdr+24) = sampleRate;
+  *(uint32_t*)(hdr+28) = byteRate;
+  *(uint16_t*)(hdr+32) = blockAlign;
+  *(uint16_t*)(hdr+34) = bitsPerSample;
+  // data chunk
+  memcpy(hdr+36, "data", 4);
+  *(uint32_t*)(hdr+40) = 0;                 
+
+  f.write(hdr, 44);
+}
+
+void patchWavSizes(File &f, uint32_t dataBytes) {
+
+  uint32_t riffSize = 36 + dataBytes;
+  f.seek(4);  f.write((uint8_t*)&riffSize, 4);
+  f.seek(40); f.write((uint8_t*)&dataBytes, 4);
+}
+
+// ---- SD playback (double-buffered) ----
+void refillIfNeeded() {
+  if (!sdPlaying || !playFile) return;
+
+  if (!bufAReady) {
+    int32_t bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * 2);
+    if (bytesRead <= 0) {
+      playFile.seek(44);
+      bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * 2);
+    }
+    validA = (uint32_t)bytesRead / 2;  
+    rdIndexA = 0;
+    bufAReady = (validA > 0);
+  }
+
+  if (!bufBReady) {
+    int32_t bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * 2);
+    if (bytesRead <= 0) {
+      playFile.seek(44);
+      bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * 2);
+    }
+    validB = (uint32_t)bytesRead / 2;
+    rdIndexB = 0;
+    bufBReady = (validB > 0);
+  }
+}
+
+void queueFromBuffer() {
+  static uint32_t sdPlayedBlockCount = 0;
+  if (!sdPlaying) {
+    sdPlayedBlockCount = 0;
+    return;
+  }
+  int slots = playbackQueue.available();
+  while (slots-- > 0 && sdPlayedBlockCount < sdBlocksToPlay) {
+    int16_t *destBuf = playbackQueue.getBuffer();
+    if (!destBuf) break;
+
+    // Pick current source buffer
+    int16_t *sourceBuf;
+    uint32_t *readIndexPtr, *validSamplesPtr;
+    bool *bufferReadyPtr;
+    if (useA) {
+      sourceBuf = sdBufA;
+      readIndexPtr = (uint32_t*)&rdIndexA;
+      validSamplesPtr = (uint32_t*)&validA;
+      bufferReadyPtr = (bool*)&bufAReady;
+    } else {
+      sourceBuf = sdBufB;
+      readIndexPtr = (uint32_t*)&rdIndexB;
+      validSamplesPtr = (uint32_t*)&validB;
+      bufferReadyPtr = (bool*)&bufBReady;
+    }
+
+    // If current empty, switch and try the other
+    if (!*bufferReadyPtr || *readIndexPtr + BLOCK_SAMPLES > *validSamplesPtr) {
+      useA = !useA;
+      if (useA) {
+        sourceBuf = sdBufA;
+        readIndexPtr = (uint32_t*)&rdIndexA;
+        validSamplesPtr = (uint32_t*)&validA;
+        bufferReadyPtr = (bool*)&bufAReady;
+      } else {
+        sourceBuf = sdBufB;
+        readIndexPtr = (uint32_t*)&rdIndexB;
+        validSamplesPtr = (uint32_t*)&validB;
+        bufferReadyPtr = (bool*)&bufBReady;
+      }
+
+      if (!*bufferReadyPtr || *readIndexPtr + BLOCK_SAMPLES > *validSamplesPtr) {
+        // nothing ready yet
+        break;
+      }
+    }
+
+    // Only copy if there are enough samples
+    if (*readIndexPtr + BLOCK_SAMPLES <= *validSamplesPtr) {
+      memcpy(destBuf, sourceBuf + *readIndexPtr, BLOCK_SAMPLES * sizeof(int16_t));
+      *readIndexPtr += BLOCK_SAMPLES;
+    } else {
+      // Not enough samples left, fill with zeros
+      int remaining = *validSamplesPtr - *readIndexPtr;
+      if (remaining > 0) memcpy(destBuf, sourceBuf + *readIndexPtr, remaining * sizeof(int16_t));
+      memset(destBuf + remaining, 0, (BLOCK_SAMPLES - remaining) * sizeof(int16_t));
+      *readIndexPtr = *validSamplesPtr;
+    }
+
+    sdPlayedBlockCount++;
+    if (*readIndexPtr >= *validSamplesPtr) { *bufferReadyPtr = false; } 
+    playbackQueue.playBuffer();
+  }
+  if (sdPlayedBlockCount >= sdBlocksToPlay) {
+    // End of file reached
+    stopSDPlay();
+    sdPlayedBlockCount = 0;
+    playFromSD = false;
+    Serial.println("SD: Playback finished");
+  }
+}
+
+/* ---- setup ---- */
+void setup(){
+    // Effects menu: triggered by holding menuBtnDown in menu mode
+  menuBtnDown.onHold([](int){
+    if (uiMode == MODE_MENU) {
+      uiMode = MODE_EFFECTS_MENU;
+      inEffectsMenu = true;
+      effectsMenuIndex = 0;
+      drawEffectsMenu();
+    }
+  }, 600);
+  menuBtnUp.onPress([](int){
+    if (inPlaybackScreen) {
+      inPlaybackScreen = false;
+      drawMenu();
+      return;
+    }
+    if (uiMode == MODE_EFFECTS_MENU) {
+      effectsMenuIndex--;
+      if (effectsMenuIndex < 0) effectsMenuIndex = FX_COUNT - 1; 
+      drawEffectsMenu();
+      return;
+    }
+    if (uiMode == MODE_SDREC) {
+  sdRecMaxBlocks += 500;
+  if (sdRecMaxBlocks > 4000) sdRecMaxBlocks = 4000;
+      tft.fillRect(0, 108, 128, 12, BLACK);
+      tft.setCursor(4, 108);
+      tft.setTextColor(CYAN);
+      tft.print("SD Blocks: ");
+      tft.print(sdRecMaxBlocks);
+    } else if (uiMode == MODE_MENU) {
+      menuIndex--;
+      if (menuIndex < 0) menuIndex = 0;
+      drawMenu();
+    }
+  });
+  menuBtnDown.onPress([](int){
+    if (inPlaybackScreen) {
+      inPlaybackScreen = false;
+      drawMenu();
+      return;
+    }
+    if (uiMode == MODE_EFFECTS_MENU) {
+      effectsMenuIndex++;
+      if (effectsMenuIndex >= FX_COUNT) effectsMenuIndex = 0; 
+      drawEffectsMenu();
+      return;
+    }
+    if (uiMode == MODE_SDREC) {
+  sdRecMaxBlocks -= 500;
+  if (sdRecMaxBlocks < 100) sdRecMaxBlocks = 100;
+      tft.fillRect(0, 108, 128, 12, BLACK); 
+      tft.setCursor(4, 108);
+      tft.setTextColor(CYAN);
+      tft.print("SD Blocks: ");
+      tft.print(sdRecMaxBlocks);
+    } else if (uiMode == MODE_MENU) {
+      menuIndex++;
+      if (menuIndex >= menuLength) menuIndex = 0; 
+    drawMenu();
+    } else if (uiMode == MODE_RAM) {
+      currentFX = (FXType)((currentFX + 1) % FX_COUNT);
+      tft.fillRect(0, 40, 128, 20, BLACK);
+      float d = 0.0f;
+      switch (currentFX) {
+        case FX_REVERB: d = reverbDepth; break;
+        case FX_BITCRUSH: d = bitcrushDepth; break;
+        case FX_LOWPASS: d = lowpassDepth; break;
+        default: break;
+      }
+      drawFX(d, analogRead(POT_VOL) / 1023.0f);
+    }
+  });
+  pinMode(INPUT_SWITCH_PIN, INPUT_PULLUP); 
+
+  // Button 1: Record/Arm in RAM or SDREC modes; toggle poly/mono in menu mode
+  button1.onPress([](int){
+    // toggle or record based on uiMode
+    if (uiMode == MODE_SDREC) {
+      // Start armed record or stop recording
+      if (!isRecording && !armedRecord) {
+        startArmedRecord();
+      } else {
+        stopRecording();
+      }
+      return;
+    }
+    if (uiMode == MODE_RAM) {
+      // RAM mode: record/stop
+      if (!isRecording && !armedRecord) {
+        startArmedRecord();
+      } else {
+        stopRecording();
+      }
+      return;
+    }
+    if (uiMode == MODE_MENU) {
+      sdPolyMode = !sdPolyMode;
+      tft.fillRect(0, 120, 128, 8, BLACK);
+      tft.setCursor(4, 120);
+      tft.setTextColor(CYAN);
+      tft.print(sdPolyMode ? "Poly SDPlay" : "Mono SDPlay");
+    }
+  });
+
+  // Button 2: Select in menu , play in other modes
+  button2.onPress([](int){
+    if (uiMode == MODE_EFFECTS_MENU) {
+      // Set selected effect for SD playback and return to menu
+      sdPlayFX = (FXType)effectsMenuIndex;
+      uiMode = MODE_MENU;
+      inEffectsMenu = false;
+      applyEffectsNow();
+      drawMenu();
+      return;
+    }
+    if (uiMode == MODE_MENU) {
+      if (sdPolyMode) {
+        int selIndex1 = menuIndex;
+        int selIndex2 = (menuIndex + 1) % menuLength;
+        String selName1 = String(menuItems[selIndex1]);
+        String selName2 = String(menuItems[selIndex2]);
+        if (!selName1.endsWith("/") && !selName2.endsWith("/")) {
+          String fullPath1 = currentPath + selName1;
+          String fullPath2 = currentPath + selName2;
+          startSDPolyPlay(fullPath1.c_str(), fullPath2.c_str());
+          current = ST_PLAYING;
+          drawStatus(current);
+          // Show playback screen for first file
+          inPlaybackScreen = true;
+          playbackFile = fullPath1;
+          drawPlaybackScreen();
+        }
+    } else {
+        // Monophonic: play only selected file
+        int selIndex = menuIndex;
+        String selName = String(menuItems[selIndex]);
+        if (!selName.endsWith("/")) {
+          String fullPath1 = currentPath + selName;
+      // ensure no poly voices are active
+      stopSDPolyPlay();
+      startSDPlay(fullPath1.c_str());
+          current = ST_PLAYING;
+          drawStatus(current);
+          inPlaybackScreen = true;
+          playbackFile = fullPath1;
+          drawPlaybackScreen();
+        }
+      }
+    } else {
+      if (isRecording || armedRecord) stopRecording();
+      if (isSDRecording) {
+        playFromSD = true;
+        startSDPlay("/loop.wav");
+        current = ST_PLAYING; drawStatus(current);
+      } else {
+        playFromSD = false;
+        startPlayback();
+      }
+    }
+  });
+
+ // Re-enable effect on hold in RAM mode
+  static float lastReverbDepth = 0.3f;
+  static float lastBitcrushDepth = 0.3f;
+  static float lastLowpassDepth = 0.3f;
+  button3.onPress([](int){
+    if (uiMode == MODE_EFFECTS_MENU) {
+      sdPlayFXEnabled[effectsMenuIndex] = !sdPlayFXEnabled[effectsMenuIndex];
+      applyEffectsNow();
+      drawEffectsMenu();
+      return;
+    }
+    if (uiMode == MODE_RAM) {
+      switch (currentFX) {
+        case FX_REVERB:
+          lastReverbDepth = reverbDepth > 0.01f ? reverbDepth : lastReverbDepth;
+          reverbDepth = 0.0f;
+          reverb.roomsize(0.01f);
+          break;
+        case FX_BITCRUSH:
+          lastBitcrushDepth = bitcrushDepth > 0.01f ? bitcrushDepth : lastBitcrushDepth;
+          bitcrushDepth = 0.0f;
+          // bitcrushFX.bits(16);
+          // bitcrushFX.sampleRate(1.0f);
+          break;
+        case FX_LOWPASS:
+          lastLowpassDepth = lowpassDepth > 0.01f ? lowpassDepth : lastLowpassDepth;
+          lowpassDepth = 0.0f;
+          lowpassFX.setLowpass(0, 12000.0f, 0.707f);
+          break;
+        default:
+          break;
+      }
+      tft.fillRect(0, 40, 128, 20, BLACK);
+      drawFX(0.0f, analogRead(POT_VOL) / 1023.0f);
+      tft.setCursor(4, 60);
+      tft.setTextColor(RED);
+      tft.print("Effect Disabled");
+    } else if (uiMode != MODE_MENU) {
+      stopRecording();
+      stopPlayback();
+      stopSDRecord();
+      current = ST_STOPPED; drawStatus(current);
+    }
+    // else: do nothing in menu mode
+  });
+
+  // Re-enable effect on hold in RAM mode
+  button3.onHold([](int){
+    if (uiMode == MODE_RAM) {
+      switch (currentFX) {
+        case FX_REVERB:
+          reverb.roomsize(reverbDepth > 0.01f ? (reverbDepth * 0.95f) : 0.01f);
+          break;
+        case FX_BITCRUSH:
+          break;
+        case FX_LOWPASS:
+          {
+            float minCutoff = 500.0f;
+            float maxCutoff = 12000.0f;
+            float cutoff = maxCutoff - lowpassDepth * (maxCutoff - minCutoff);
+            if (lowpassDepth < 0.01f) cutoff = maxCutoff;
+            lowpassFX.setLowpass(0, cutoff, 0.707f);
+          }
+          break;
+        default:
+          break;
+      }
+      tft.fillRect(0, 40, 128, 20, BLACK);
+      drawFX((currentFX == FX_REVERB ? reverbDepth : currentFX == FX_BITCRUSH ? bitcrushDepth : lowpassDepth), analogRead(POT_VOL) / 1023.0f);
+      tft.setCursor(4, 60);
+      tft.setTextColor(GREEN);
+      tft.print("Effect Enabled");
+    }
+    // else: do nothing in other modes
+  });
+
+  // Delete Button
+  button4.onPress([](int){
+    if (uiMode == MODE_MENU) {
+      String sel = String(menuItems[menuIndex]);
+      if (!sel.endsWith("/")) {
+        // File: delete it
+        String fullPath = currentPath + sel;
+        if (SD.exists(fullPath.c_str())) {
+          SD.remove(fullPath.c_str());
+          tft.setCursor(4, 120);
+          tft.setTextColor(RED);
+          tft.print("Deleted: ");
+          tft.print(sel);
+          scanSDMenu(currentPath);
+          drawMenu();
+        }
+      }
+    } else {
+      deleteSample();
+    }
+  });
+
+  // Mode toggle button
+  button5.onPress([](int){
+    // Cycle mode
+    uiMode = static_cast<UIMode>((uiMode + 1) % 3);
+    // Reset all state and buffers when switching modes
+    isRecording = false;
+    isPlaying = false;
+    armedRecord = false;
+    stopSDRecord();
+    stopSDPlay();
+    stopPlayback();
+    blocksRecorded = 0;
+    loopPlayIndex = 0;
+    memset(loopBuffer, 0, sizeof(loopBuffer));
+    // Set SD recording flag
+    isSDRecording = (uiMode == MODE_SDREC);
+    // set mixer gains for RAM mode when entering RAM mode
+    if (uiMode == MODE_RAM) {
+      mix.gain(0, 1.0f);   
+      mix.gain(1, 0.8f);   
+      mix.gain(2, 0.0f);   
+    }
+    drawHeader();
+    drawStatus(ST_READY);
+    drawCounts(0);
+    tft.setCursor(4, 120);
+    if (uiMode == MODE_SDREC) {
+      tft.setTextColor(GREEN); tft.print("SD Rec: ON  ");
+    } else if (uiMode == MODE_RAM) {
+      tft.setTextColor(RED); tft.print("SD Rec: OFF ");
+    } else if (uiMode == MODE_MENU) {
+      tft.setTextColor(CYAN); tft.print("MENU MODE   ");
+      scanSDMenu(currentPath);
+      drawMenu(); // Draw menu once when entering menu mode
+    }
+  });
+  Serial.begin(115200);
+  while (!Serial && millis() < 2000) ; 
+  tft.begin();
+  drawHeader(); drawStatus(ST_READY); drawFX(0.30f, 0.60f); drawCounts(0);
+
+  AudioMemory(320);
+  sgtl5000.enable();
+  sgtl5000.inputSelect(AUDIO_INPUT_LINEIN); 
+  sgtl5000.lineOutLevel(6);               
+  sgtl5000.lineInLevel(15);               
+  sgtl5000.volume(0.60f);
+
+  hp.setHighpass(0, 20.0f, 0.707f);
+  // Always set mixer gains for RAM mode at startup
+  mix.gain(0, 1.0f);   // dry/live ON
+  mix.gain(1, 0.8f);   // loop path default
+  mix.gain(2, 0.0f);   // SD poly mix muted
+  reverb.roomsize(0.25f);
+  reverb.damping(0.50f);
+
+  // Set input mixer: only line-in active
+  inputMix.gain(0, 0.0f); 
+  inputMix.gain(1, 1.0f); 
+
+  // Stop button: stop both RAM and SD playback and recording
+  button3.onPress([](int){
+    stopRecording();
+    stopPlayback();
+    stopSDRecord();
+    current = ST_STOPPED; drawStatus(current);
+  });
+
+  pinMode(CLIP_LED_PIN, OUTPUT);
+  digitalWrite(CLIP_LED_PIN, LOW);
+
+if (!SD.begin(SD_CS)) {
+  tft.setCursor(4, 80); tft.setTextColor(RED); tft.println("SD init failed");   //show SD init failure on screen
+}
+  drawMenu();
+}
+
+/* ---- loop ---- */
+void loop(){
+  // Audio memory usage message
+  static elapsedMillis ramTimer = 0;
+  if (ramTimer > 2000) {
+    Serial.print("AudioMemoryUsage: ");
+    Serial.print(AudioMemoryUsage());
+    Serial.print(" / ");
+    Serial.println(AudioMemoryUsageMax());
+    ramTimer = 0;
+  }
+  for (int i = 0; i < 7; ++i) buttonArray[i]->process();
+
+  // Line-in as input
+  inputMix.gain(0, 0.0f); 
+  inputMix.gain(1, 1.0f); 
+  sgtl5000.inputSelect(AUDIO_INPUT_LINEIN); 
+
+  // Always process SD playback, even in menu mode
+  if (playFromSD && sdPlaying) {
+    refillIfNeeded();
+  int slots = playbackQueue.available();
+    int toQueue = min(slots, 8); 
+    while (toQueue-- > 0 && slots-- > 0) {
+      queueFromBuffer();
+    }
+    // More throttling debugging
+    static uint32_t lastDbg = 0;
+    if (millis() - lastDbg > 500) {
+      Serial.print("SDPlay: validA="); Serial.print(validA);
+      Serial.print(" rdIndexA="); Serial.print(rdIndexA);
+      Serial.print(" bufAReady="); Serial.print(bufAReady);
+      Serial.print(" | validB="); Serial.print(validB);
+      Serial.print(" rdIndexB="); Serial.print(rdIndexB);
+      Serial.print(" bufBReady="); Serial.print(bufBReady);
+      Serial.print(" | AudioMemoryUsage: "); Serial.print(AudioMemoryUsage());
+      Serial.print(" / "); Serial.println(AudioMemoryUsageMax());
+      lastDbg = millis();
+    }
+  }
+
+  if (uiMode == MODE_MENU) {
+    if (inPlaybackScreen) {
+      // Throttle playback overlay redraws to avoid constant drawing
+      static uint32_t lastPlayDraw = 0;
+      static String lastPlayFile = "";
+      if (playbackFile != lastPlayFile || millis() - lastPlayDraw > 1000) {
+        drawPlaybackScreen();
+        lastPlayDraw = millis();
+        lastPlayFile = playbackFile;
+      }
+      menuBtnUp.process();
+      menuBtnDown.process();
+      return;
+    } else {
+      menuBtnUp.process();
+      menuBtnDown.process();
+      return;
+    }
+  }
+  // Effects menu logic
+  if (uiMode == MODE_EFFECTS_MENU) {
+    static int lastEffectsMenuIndex = -1;
+    static bool lastEffectsMenuScreen = false;
+    static bool lastFXEnabled[FX_COUNT] = {false, false, false};
+    static float lastFXDepth[FX_COUNT] = {0.0f, 0.0f, 0.0f};
+    bool shouldRedraw = false;
+    // Redraws only if index or effect state changes
+    if (lastEffectsMenuIndex != effectsMenuIndex || !lastEffectsMenuScreen) {
+      shouldRedraw = true;
+    }
+    for (int fxIdx = 0; fxIdx < FX_COUNT; ++fxIdx) {
+      if (lastFXEnabled[fxIdx] != sdPlayFXEnabled[fxIdx] || lastFXDepth[fxIdx] != sdPlayFXDepth[fxIdx]) {
+        shouldRedraw = true;
+        break;
+      }
+    }
+  float fxPotVal = analogRead(POT_FX) / 1023.0f;
+    static float lastFxPotVal = -1.0f;
+    if (fabs(fxPotVal - lastFxPotVal) > 0.01f) { 
+      tft.fillRect(64, 24, 64, 104, BLACK);
+      sdPlayFXDepth[effectsMenuIndex] = fxPotVal;
+      applyEffectsNow();
+      switch (effectsMenuIndex) {
+        case FX_REVERB: {
+          int knobCenterX = 64 + 32, knobCenterY = 60, knobRadius = 20;
+          tft.drawCircle(knobCenterX, knobCenterY, knobRadius, GRAY);
+          float angle = 3.14159f * (0.75f + 1.5f * fxPotVal);
+          int knobHandleX = knobCenterX + (int)(knobRadius * cos(angle));
+          int knobHandleY = knobCenterY + (int)(knobRadius * sin(angle));
+          tft.drawLine(knobCenterX, knobCenterY, knobHandleX, knobHandleY, CYAN);
+          tft.setTextColor(CYAN); tft.setCursor(knobCenterX-20, knobCenterY+36);
+      tft.print("Depth: "); tft.print(fxPotVal,2);
+          break;
+        }
+        case FX_BITCRUSH: {
+          int bars = 8 + (int)(fxPotVal * 8.0f);
+          int barX = 68, barY = 40;
+          for (int barIdx = 0; barIdx < 16; ++barIdx) {
+            int barHeight = 4 + barIdx;
+            uint16_t col = (barIdx < bars) ? CYAN : GRAY;
+            tft.fillRect(barX + barIdx*3, barY + 32 - barHeight, 2, barHeight, col);
+          }
+          tft.setTextColor(CYAN); tft.setCursor(barX, barY+48);
+      tft.print("Bits: "); tft.print(bars);
+          break;
+        }
+        case FX_LOWPASS: {
+          int curveBaseY = 90, curveWidth = 56, curveHeight = 24;
+          float cutoff = 12000.0f - fxPotVal * (12000.0f - 500.0f);
+          for (int curveX = 0; curveX < curveWidth; ++curveX) {
+            float freq = 500.0f + (curveX/(float)curveWidth)*(12000.0f-500.0f);
+            float curveY = curveHeight * exp(-freq/cutoff);
+            tft.drawPixel(64 + curveX, curveBaseY - (int)curveY, CYAN);
+          }
+          tft.setTextColor(CYAN); tft.setCursor(66, curveBaseY+16);
+          tft.print("Cutoff: "); tft.print((int)cutoff);
+          break;
+        }
+        default: break;
+      }
+      lastFxPotVal = fxPotVal;
+    }
+    if (shouldRedraw) {
+      drawEffectsMenu();
+      lastEffectsMenuIndex = effectsMenuIndex;
+      lastEffectsMenuScreen = true;
+      for (int fxIdx = 0; fxIdx < FX_COUNT; ++fxIdx) {
+        lastFXEnabled[fxIdx] = sdPlayFXEnabled[fxIdx];
+        lastFXDepth[fxIdx] = sdPlayFXDepth[fxIdx];
+      }
+      lastFxPotVal = fxPotVal; 
+    }
+    menuBtnUp.process();
+    menuBtnDown.process();
+    button2.process();
+    button3.process();
+    return;
+  }
+
+  // Update FX and volume from pots
+  float fxDepth = analogRead(POT_FX) / 1023.0f;
+  float masterVolume = analogRead(POT_VOL) / 1023.0f;
+  // Live hearback logic for all modes
+  if (uiMode == MODE_RAM) {
+    if (sdPolyPlaying) {
+      mix.gain(0, 0.0f);
+      mix.gain(1, 0.0f);
+      mix.gain(2, 1.0f);
+    } else if (!isPlaying) {
+      mix.gain(0, 1.0f);
+      mix.gain(1, 0.8f);
+      mix.gain(2, 0.0f);
+    } else {
+      mix.gain(0, 0.0f);
+      mix.gain(1, 1.0f);
+      mix.gain(2, 0.0f);
+    }
+    switch (currentFX) {
+      case FX_REVERB:
+        reverbDepth = fxDepth;
+        reverb.roomsize(reverbDepth > 0.01f ? (reverbDepth * 0.95f) : 0.01f);
+        break;
+      case FX_BITCRUSH:
+        // Bitcrushing bypassed for now
+        // bitcrushDepth = depth;
+        // int bits = 16 - (int)(bitcrushDepth * 8.0f);
+        // if (bits < 8) bits = 8;
+        // if (bits > 16) bits = 16;
+        // float downsample = 1.0f + bitcrushDepth * 7.0f;
+        // bitcrushFX.bits(bits);
+        // bitcrushFX.sampleRate(downsample);
+        break;
+      case FX_LOWPASS:
+        lowpassDepth = fxDepth;
+        {
+          float minCutoff = 500.0f;
+          float maxCutoff = 12000.0f;
+          float cutoff = maxCutoff - lowpassDepth * (maxCutoff - minCutoff);
+          if (lowpassDepth < 0.01f) cutoff = maxCutoff;
+          lowpassFX.setLowpass(0, cutoff, 0.707f);
+        }
+        break;
+      default:
+        break;
+    }
+  } else if (uiMode == MODE_SDREC) {
+    if (!isRecording && !armedRecord && !isPlaying && !sdPolyPlaying) {
+      mix.gain(0, 1.0f);
+      mix.gain(1, 0.8f);
+      mix.gain(2, 0.0f);
+    }
+  }
+  // SD playback effect processing 
+  if (playFromSD && sdPlaying) {
+    FXType fx = sdPlayFX;
+    float fxDepth = sdPlayFXDepth[fx];
+    bool fxEnabled = sdPlayFXEnabled[fx];
+    switch (fx) {
+      case FX_REVERB:
+        reverb.roomsize(fxEnabled ? (fxDepth > 0.01f ? fxDepth * 0.95f : 0.01f) : 0.01f);
+        break;
+      case FX_BITCRUSH:
+        // bitcrushFX.bits(fxEnabled ? (16 - (int)(fxDepth * 8.0f)) : 16);
+        // bitcrushFX.sampleRate(fxEnabled ? (1.0f + fxDepth * 7.0f) : 1.0f);
+        break;
+      case FX_LOWPASS:
+        {
+          float minCutoff = 500.0f;
+          float maxCutoff = 12000.0f;
+          float cutoff = fxEnabled ? (maxCutoff - fxDepth * (maxCutoff - minCutoff)) : maxCutoff;
+          if (fxDepth < 0.01f || !fxEnabled) cutoff = maxCutoff;
+          lowpassFX.setLowpass(0, cutoff, 0.707f);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  sgtl5000.volume(constrain(masterVolume, 0.0f, 1.0f));  
+  if (!isSDRecording) {
+    // UI ~20 Hz
+    static elapsedMillis uiTick = 0;
+    if (uiTick > 50){
+  drawFX(fxDepth, masterVolume);
+      if (isPlaying && blocksRecorded > 0) {
+        int peak = 0;
+        if (loopPlayIndex < blocksRecorded) {
+          for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+            int val = abs(loopBuffer[loopPlayIndex][i]);
+            if (val > peak) peak = val;
+          }
+        }
+        float normPeak = (float)peak / 32768.0f;
+        drawMeter(normPeak);
+      } else if (peakL.available()) {
+        drawMeter(peakL.read());
+      }
+      if (current == ST_RECORDED || current == ST_PLAYING) {
+        drawWaveform();
+      }
+      uiTick = 0;
+    }
+  }
+
+  // handle recording/arming
+  if (armedRecord || isRecording){
+    while (recordQueue.available()){
+      const int16_t* b = (const int16_t*)recordQueue.readBuffer(); // 128 mono samples
+      if (armedRecord) {
+        float lvl = peakL.available() ? peakL.read() : 0.0f;
+        if (lvl >= ARM_LEVEL_THRESHOLD) {
+          startRecordingNow(); // switch to recording state
+          // store THIS triggering block as first block
+          if (isSDRecording) {
+            if (wavFile && blocksRecorded < MAX_BLOCKS) {
+              wavFile.write((const uint8_t*)b, BLOCK_SAMPLES * sizeof(int16_t));
+              samplesWritten += BLOCK_SAMPLES;
+              blocksRecorded++;
+              drawCounts(blocksRecorded);
+              yield();
+              if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+            }
+          } else if (blocksRecorded < MAX_BLOCKS) {
+            memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+            blocksRecorded++;
+            drawCounts(blocksRecorded);
+            if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+          }
+        }
+  recordQueue.freeBuffer();
+        continue;
+      }
+
+      // Active recording
+      if (isRecording) {
+        if (isSDRecording) {
+          // SD mode: write to SD only
+          if (wavFile && blocksRecorded < sdRecMaxBlocks) {
+            wavFile.write((const uint8_t*)b, BLOCK_SAMPLES * sizeof(int16_t));
+            samplesWritten += BLOCK_SAMPLES;
+            blocksRecorded++;
+            drawCounts(blocksRecorded);
+            yield(); // allow UI and other tasks to run
+            if (blocksRecorded >= sdRecMaxBlocks) { stopRecording(); break; }
+          }
+        } else {
+          // RAM mode: store in RAM only
+          if (blocksRecorded < MAX_BLOCKS) {
+            memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+            blocksRecorded++;
+            drawCounts(blocksRecorded);
+            if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+          }
+        }
+  recordQueue.freeBuffer();
+      }
+    }
+  }
+
+  // RAM playback
+  if (isPlaying && !playFromSD && blocksRecorded > 0) {
+    int slots = playQ.available();
+    int toQueue = min(slots, 6); 
+    while (toQueue-- > 0 && slots-- > 0) {
+      if (loopPlayIndex >= blocksRecorded) loopPlayIndex = 0;
+  int16_t *outBuffer = playbackQueue.getBuffer();
+      if (outBuffer) {
+        memcpy(outBuffer, loopBuffer[loopPlayIndex], BLOCK_SAMPLES * sizeof(int16_t));
+  playbackQueue.playBuffer();
+        loopPlayIndex++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // SD playback 
+  if (playFromSD && sdPlaying) {
+    refillIfNeeded();
+  int slots = playbackQueue.available();
+    int toQueue = min(slots, 8); 
+    while (toQueue-- > 0 && slots-- > 0) {
+      queueFromBuffer();
+    }
+    // Debug: print buffer status 
+    Serial.print("SDPlay: validA="); Serial.print(validA);
+    Serial.print(" rdIndexA="); Serial.print(rdIndexA);
+    Serial.print(" bufAReady="); Serial.print(bufAReady);
+    Serial.print(" | validB="); Serial.print(validB);
+    Serial.print(" rdIndexB="); Serial.print(rdIndexB);
+    Serial.print(" bufBReady="); Serial.print(bufBReady);
+    Serial.print(" | AudioMemoryUsage: "); Serial.print(AudioMemoryUsage());
+    Serial.print(" / "); Serial.println(AudioMemoryUsageMax());
+  }
+
+  menuBtnUp.process();
+  menuBtnDown.process();
+}

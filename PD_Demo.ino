@@ -275,15 +275,13 @@ void drawMenu() {
     y += 16;
   }
 
-  // Clear preview area first
   tft.fillRect(0, 96, 128, 32, BLACK);
   String sel = String(menuItems[menuIndex]);
-  // Show preview for .WAV files, not folders
   if (!sel.endsWith("/") && sel.endsWith(".WAV")) {
     String fullPath = currentPath + sel;
   FsFile f = sdfs.open(fullPath.c_str(), FILE_READ);
     if (f && f.size() > 44) {
-      f.seek(44); // skip WAV header
+      f.seek(44); 
       const int previewSamples = 1024;
       int16_t *buf = (int16_t*)extmem_malloc(previewSamples * sizeof(int16_t));
       if (!buf) {
@@ -293,14 +291,12 @@ void drawMenu() {
         if (n > 0) {
           n = n / 2; 
           for (int i = n; i < previewSamples; ++i) buf[i] = 0;
-          // Find peak for scaling 
           int16_t peak = 256;
           for (int i = 0; i < n; ++i) {
             int16_t s = abs(buf[i]);
             if (s > peak) peak = s;
           }
           if (peak < 1) peak = 1;
-          // Draw waveform
           for (int x = 0; x < 128; ++x) {
             int sampleIndex = x * n / 128;
             if (sampleIndex >= n) sampleIndex = n - 1;
@@ -341,7 +337,6 @@ void drawEffectsMenu() {
   tft.print(sdPlayFXEnabled[effectsMenuIndex] ? "Enabled" : "Disabled");
 
 
-  // Draw effect visual
   tft.fillRect(64, 24, 64, 72, BLACK); 
   float potVal = analogRead(POT_FX) / 1023.0f;
   switch (effectsMenuIndex) {
@@ -766,12 +761,12 @@ void stopSDPolyPlay() {
 }
 
 void startSDPlay(const char* path) {
-  stopSDPlay();                 // hard reset any prior state
+  stopSDPlay();                 
   flushPlaybackQueue();       
-  // If overdubbing is enabled, allow the dry/live input path through while SD plays
+
   mix.gain(0, overdubEnabled ? 1.0f : 0.0f);
-  mix.gain(1, 1.0f);            // queue path full
-  mix.gain(2, 0.0f);            // poly path muted
+  mix.gain(1, 1.0f);           
+  mix.gain(2, 0.0f);           
 
   playFile = sdfs.open(path, FILE_READ);
   if (!playFile) {
@@ -789,11 +784,9 @@ void startSDPlay(const char* path) {
   Serial.print(" bits="); Serial.print(wi.bits);
   Serial.print(" bytes="); Serial.println(wi.dataBytes);
 
-  // compute file length in queue blocks
   sdBlocksToPlay = wi.dataBytes / (BLOCK_SAMPLES * sizeof(int16_t));
   if (sdBlocksToPlay < 1) sdBlocksToPlay = 1;
 
-  // reset double buffers
   rdIndexA = rdIndexB = 0;
   validA = validB = 0;
   bufAReady = bufBReady = false;
@@ -845,18 +838,17 @@ void writeWavHeader(FsFile &f, uint32_t sampleRate, uint16_t bitsPerSample, uint
   uint16_t blockAlign = channels * (bitsPerSample/8);
   // RIFF chunk
   memcpy(hdr+0,  "RIFF", 4);
-  *(uint32_t*)(hdr+4)  = 0;                 // placeholder file size-8
+  *(uint32_t*)(hdr+4)  = 0;             
   memcpy(hdr+8,  "WAVE", 4);
   // fmt chunk
   memcpy(hdr+12, "fmt ", 4);
-  *(uint32_t*)(hdr+16) = 16;                // PCM header size
-  *(uint16_t*)(hdr+20) = 1;                 // PCM format
+  *(uint32_t*)(hdr+16) = 16;              
+  *(uint16_t*)(hdr+20) = 1;                 
   *(uint16_t*)(hdr+22) = channels;
   *(uint32_t*)(hdr+24) = sampleRate;
   *(uint32_t*)(hdr+28) = byteRate;
   *(uint16_t*)(hdr+32) = blockAlign;
   *(uint16_t*)(hdr+34) = bitsPerSample;
-  // data chunk
   memcpy(hdr+36, "data", 4);
   *(uint32_t*)(hdr+40) = 0;                 
 
@@ -870,7 +862,7 @@ void patchWavSizes(FsFile &f, uint32_t dataBytes) {
   f.seek(40); f.write((uint8_t*)&dataBytes, 4);
 }
 
-//  SD playback (double-buffered) 
+//  SD playback
 void refillIfNeeded() {
   if (!sdPlaying || !playFile) return;
 

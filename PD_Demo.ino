@@ -1,94 +1,76 @@
-// ---- FX Types ----
-enum FXType { FX_REVERB, FX_BITCRUSH, FX_LOWPASS, FX_COUNT };
-FXType currentFX = FX_REVERB;
-float reverbDepth = 0.3f;
-float bitcrushDepth = 0.3f;
-float lowpassDepth = 0.3f;
-// ---- Mode Handling ----
-enum UIMode { MODE_RAM, MODE_SDREC, MODE_MENU, MODE_EFFECTS_MENU };
-UIMode uiMode = MODE_RAM;
-
-// ---- Gains ----
-float usbGain = 1.0f;
-float lineInGain = 0.0f;
-
-// ---- Includes ----
-#include <cstdint>
-#include <cstdint>
 #include <Arduino.h>
 #include <Audio.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SdFat.h>
-#include <malloc.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
+#include <cstdint>
+#include <malloc.h>
+
 #include "BetterButton.h"
-SdFs sdfs;
-bool sdfsReady = false;
-
-
 #include "status.h"
 #include "functions.h"
 
-/* ---- OLED ---- */
-#define OLED_CS   26
-#define OLED_DC   27
-#define OLED_RST   9
+// Pins / display
+constexpr int OLED_CS  = 26;
+constexpr int OLED_DC  = 27;
+constexpr int OLED_RST = 9;
 Adafruit_SSD1351 tft(128, 128, &SPI, OLED_CS, OLED_DC, OLED_RST);
-#define BLACK 0x0000
-#define WHITE 0xFFFF
-#define RED   0xF800
-#define GREEN 0x07E0
-#define BLUE  0x001F
-#define YELLOW 0xFFE0
-#define CYAN  0x07FF
-#define GRAY  0x8410
 
-/* ---- Audio graph ---- */
-// AudioInputUSB usbIn; // USB input disabled
-AudioInputI2S      lineIn;      
-AudioMixer4         inputMix;    
-AudioFilterBiquad   hp;          
-AudioRecordQueue    recQ;        // mono record tap (filtered L)
-AudioRecordQueue&   recordQueue = recQ;
-AudioPlayQueue      playQ;       // mono playback (RAM loop)
-AudioPlayQueue&     playbackQueue = playQ;
-AudioPlaySdWav      playSd1;     // SD voice 1
-AudioPlaySdWav&     sdPlayer1 = playSd1;
-AudioPlaySdWav      playSd2;     // SD voice 2
-AudioPlaySdWav&     sdPlayer2 = playSd2;
-AudioMixer4         polyMix;     // mixes SD voices
-AudioMixer4&        sdPolyMixer = polyMix;
-AudioMixer4         mix;        
-AudioMixer4&        mainMixer = mix; 
-bool sdPolyPlaying = false;      // true when poly is active
-bool sdPolyMode = true;         // true enables polyphonic SD mode
-AudioEffectFreeverb reverb;
-AudioEffectBitcrusher bitcrushFX;
-AudioFilterBiquad lowpassFX;
-AudioOutputI2S      i2sOut;      
-AudioAnalyzePeak    peakL;       // input level meter
-AudioControlSGTL5000 sgtl5000;
+// Colors
+constexpr uint16_t COL_BLACK  = 0x0000;
+constexpr uint16_t COL_WHITE  = 0xFFFF;
+constexpr uint16_t COL_RED    = 0xF800;
+constexpr uint16_t COL_GREEN  = 0x07E0;
+constexpr uint16_t COL_BLUE   = 0x001F;
+constexpr uint16_t COL_YELLOW = 0xFFE0;
+constexpr uint16_t COL_CYAN   = 0x07FF;
+constexpr uint16_t COL_GRAY   = 0x8410;
 
-// wiring
-// AudioConnection pc0(usbIn, 0, inputMix, 0); // USB to inputMix channel 0 (disabled)
-AudioConnection pc0b(lineIn, 0, inputMix, 1);  // Line-in to inputMix channel 1
-AudioConnection pc1(inputMix, 0, hp, 0);       // inputMix output to highpass
-AudioConnection pc2(hp,    0, recordQueue, 0);
-AudioConnection pc3(hp,    0, mix,  0);   // dry path
-AudioConnection pc4(playbackQueue, 0, mix,  1);   // RAM loop path
-// SD poly voices
-AudioConnection pcSd1(playSd1, 0, polyMix, 0);
-AudioConnection pcSd2(playSd2, 0, polyMix, 1);
-AudioConnection pcPolyMix(polyMix, 0, mix, 2); // SD poly mix to main mix (channel 2)
-// AudioConnection pc5(mix,   0, bitcrushFX, 0); // bypassed
-// AudioConnection pcBitcrushToReverb(bitcrushFX, 0, reverb, 0); // bypassed
-AudioConnection pcMixToReverb(mix, 0, reverb, 0); // direct connection
-AudioConnection pc6(reverb,0, lowpassFX, 0);
-AudioConnection pc7(lowpassFX,0, i2sOut, 0);
-AudioConnection pc7b(lowpassFX,0, i2sOut, 1);
-AudioConnection pc8(inputMix, 0, peakL, 0);    
+// Modes / FX
+enum class Fx { Reverb, Bitcrush, Lowpass };
+enum class UiMode { Ram, SdRec, Menu, FxMenu };
+
+Fx currentFx = Fx::Reverb;
+UiMode uiMode = UiMode::Ram;
+
+// Audio graph
+AudioInputI2S        lineIn;
+AudioMixer4          inputMix;
+AudioFilterBiquad    hp;
+AudioRecordQueue     recordQueue;
+AudioPlayQueue       playQueue;
+AudioPlaySdWav       sd1, sd2;
+AudioMixer4          sdMix;      // mix SD voices
+AudioMixer4          mainMix;    // final mix before FX
+AudioEffectFreeverb  reverb;
+AudioEffectBitcrusher bitcrush;
+AudioFilterBiquad    lowpass;
+AudioOutputI2S       i2sOut;
+AudioAnalyzePeak     peakIn;
+AudioAnalyzePeak     peakOut;
+AudioControlSGTL5000 codec;
+
+// Wiring
+AudioConnection c0(lineIn, 0, inputMix, 1);
+AudioConnection c1(inputMix, 0, hp, 0);
+AudioConnection c2(hp, 0, recordQueue, 0);
+AudioConnection c3(hp, 0, mainMix, 0);
+AudioConnection c4(playQueue, 0, mainMix, 1);
+AudioConnection c5(sd1, 0, sdMix, 0);
+AudioConnection c6(sd2, 0, sdMix, 1);
+AudioConnection c7(sdMix, 0, mainMix, 2);
+AudioConnection c8(mainMix, 0, reverb, 0);
+AudioConnection c9(reverb, 0, lowpass, 0);
+AudioConnection c10(lowpass, 0, i2sOut, 0);
+AudioConnection c11(lowpass, 0, i2sOut, 1);
+AudioConnection c12(inputMix, 0, peakIn, 0);
+AudioConnection c13(reverb, 0, peakOut, 0);
+
+// SD
+SdFs sdfs;
+bool sdfsReady = false; 
 
 struct WavInfo {
   uint32_t dataOffset = 0;
@@ -115,7 +97,6 @@ WavInfo parseWavHeader(FsFile &f) {
   return wi;
 }
 
-// Flush any queued buffers in playbackQueue by filling with silence.
 void flushPlaybackQueue() {
   const int MAX_FLUSH_ITER = 4; 
   int iter = 0;
@@ -129,12 +110,10 @@ void flushPlaybackQueue() {
   }
 }
 
-/* ---- Pins ---- */
+//  Pins 
 const int buttonPins[7] = {33, 34, 35, 36, 37, 32, 30}; 
 const int POT_FX = A10;
 const int POT_VOL = A14;
-
-// Optional input switch pin; can be overridden elsewhere
 #ifndef INPUT_SWITCH_PIN
 #define INPUT_SWITCH_PIN 31
 #endif
@@ -149,10 +128,10 @@ BetterButton menuBtnDown(buttonPins[6], 6, INPUT_PULLUP); // Menu Down
 
 BetterButton* buttonArray[7] = { &button1, &button2, &button3, &button4, &button5, &menuBtnUp, &menuBtnDown };
 
-/* ---- Loop buffer ---- */
+//  Loop buffer 
 const int BLOCK_SAMPLES = 128;        
 const int MAX_BLOCKS    = 700;  
-int sdRecMaxBlocks = 4000;  // adjustable for SDREC mode
+int sdRecMaxBlocks = 4000;  
 
 DMAMEM __attribute__((aligned(32)))
 int16_t loopBuffer[MAX_BLOCKS][BLOCK_SAMPLES];
@@ -173,14 +152,14 @@ bool& playingState = isPlaying;
 bool& armedState = armedRecord;
 const float ARM_LEVEL_THRESHOLD = 0.02f;
 
-// ---- Looper state (add) ----
-bool loopCaptured = false;     // true after first loop is created
-bool overdubEnabled = false;   // toggle to layer on top of the loop
-float odInputGain = 0.8f;      // live input level into overdub
-float odFeedback  = 0.7f;      // how much of the existing loop remains
+//  Looper state 
+bool loopCaptured = false;     
+bool overdubEnabled = false;   
+float odInputGain = 0.8f;      
+float odFeedback  = 0.7f;      
 volatile bool countsDirty = false;
 
-// ---- WAV Writer state ----
+//  WAV Writer state 
 FsFile wavFile;
 volatile uint32_t samplesWritten = 0;    
 bool isSDRecording = false; 
@@ -189,7 +168,7 @@ bool isSDRecording = false;
 bool playFromSD = false; 
 uint32_t sdBlocksToPlay = 0; 
 
-// ---- WAV Reader (double-buffered) ----
+//  WAV Reader 
 FsFile playFile; 
 const uint32_t BUF_SAMPLES = 4096;       
 DMAMEM int16_t sdBufA[BUF_SAMPLES];
@@ -208,21 +187,21 @@ bool useA = true;
 bool sdPlaying = false;
 bool& sdPlaybackActive = sdPlaying;
 
-// ---- Clip indicators ----
+//  Clip indicators 
 const int CLIP_LED_PIN = 2;               
 AudioAnalyzePeak peakOut;                 
 bool clipLatched = false;                
 AudioConnection pcOutMeter(reverb, 0, peakOut, 0);
 
 
-/* ---- UI ---- */
+//  UI 
 Status current = ST_READY, lastDrawn = (Status)255;
 
 
 void drawStatus(Status s);
 
 
-// ---- SD Menu System ----
+//  SD Menu System 
 #define MAX_MENU_ITEMS 32
 char menuItems[MAX_MENU_ITEMS][32]; 
 int menuLength = 0;
@@ -245,42 +224,6 @@ void drawPlaybackScreen() {
   tft.fillRect(0, 20, 128, 108, BLACK);
   tft.setTextColor(GREEN); tft.setCursor(4, 22);
   tft.print("Playing: "); tft.print(playbackFile);
-  // Waveform preview reenable later
-  /*
-  FsFile f = sdfs.open(playbackFile.c_str(), FILE_READ);
-  if (f && f.size() > 44) {
-    f.seek(44);
-    const int previewSamples = 1024; // smaller to be safe
-    int16_t *buf = (int16_t*)extmem_malloc(previewSamples * sizeof(int16_t));
-    if (buf) {
-      int n = f.read((uint8_t*)buf, previewSamples * 2);
-      if (n > 0) {
-        n = n / 2;
-        for (int i = n; i < previewSamples; ++i) buf[i] = 0;
-        int16_t peak = 256;
-        for (int i = 0; i < n; ++i) {
-          int16_t s = abs(buf[i]);
-          if (s > peak) peak = s;
-        }
-        if (peak < 1) peak = 1;
-        for (int x = 0; x < 128; ++x) {
-          int idx = x * n / 128;
-          if (idx >= n) idx = n - 1;
-          int16_t s = buf[idx];
-          float norm = (float)s / (float)peak;
-          int y0 = 60;
-          int y1 = y0 - (int)(norm * 35.0f);
-          if (y1 < 20) y1 = 20;
-          if (y1 > 90) y1 = 90;
-          tft.drawFastVLine(x, min(y0, y1), abs(y1 - y0) + 1, CYAN);
-        }
-      }
-      extmem_free(buf);
-    }
-    f.close();
-  }
-  */
-
   tft.setTextColor(YELLOW); tft.setCursor(4, 110);
   tft.print("Menu Up/Down to exit");
 }
@@ -481,7 +424,6 @@ void drawHeader(){
   tft.setTextColor(WHITE); tft.setTextSize(1);
   tft.setCursor(4,4); tft.println("USB Looper");
   tft.drawLine(0,16,127,16,GRAY);
-  // Shows mode in header area
   tft.setTextColor(YELLOW);
   tft.setCursor(80, 4);
   switch (uiMode) {
@@ -509,6 +451,7 @@ void drawStatus(Status s){
     case ST_NOAUDIO:   tft.setTextColor(RED);    tft.print("Status: No audio"); break;
     case ST_TOOQUIET:  tft.setTextColor(RED);    tft.print("Status: Too quiet"); break;
   }
+  
 }
 void drawFX(float depth, float vol){
   tft.fillRect(0,40,128,20,BLACK);
@@ -550,9 +493,9 @@ void drawMeter(float p){
 
 
 inline int sampleToY(int16_t sample) {
-  float normalized = (float)sample / (float)waveformPeak;   // roughly -1..1
+  float normalized = (float)sample / (float)waveformPeak;   
   int centerY = 104;
-  int mappedY = centerY - (int)(normalized * 20.0f);   // ±20 px
+  int mappedY = centerY - (int)(normalized * 20.0f);   
   if (mappedY < 64) mappedY = 64;
   if (mappedY > 128) mappedY = 128;
   return mappedY;
@@ -578,19 +521,17 @@ void drawWaveform() {
   }
 }
 
-/* ---- Fade out Logic ---- */
+//  Fade out Logic 
 void applyFadeInOut() {
   if (blocksRecorded <= 0) return;
   const int fadeN = min(64, BLOCK_SAMPLES);
   if (fadeN <= 1) {
-    // Short buffers: ensure start and end samples are zero
     loopBuffer[0][0] = 0;
     int lastBlockIndex_local = blocksRecorded - 1;
     loopBuffer[lastBlockIndex_local][BLOCK_SAMPLES - 1] = 0;
     return;
   }
 
-  // Fade-in on first block using Hann window
   for (int fadePos = 0; fadePos < fadeN; ++fadePos) {
     float win = 0.5f * (1.0f - cosf(M_PI * (float)fadePos / (float)(fadeN - 1)));
     int32_t sampleVal = loopBuffer[0][fadePos];
@@ -599,7 +540,6 @@ void applyFadeInOut() {
   }
 
   int lastBlockIndex = blocksRecorded - 1;
-  // Fade-out on last block using complementary Hann window
   for (int fadePos = 0; fadePos < fadeN; ++fadePos) {
     float win = 0.5f * (1.0f - cosf(M_PI * (float)fadePos / (float)(fadeN - 1)));
     float gain = 1.0f - win;
@@ -613,9 +553,6 @@ void applyFadeInOut() {
   loopBuffer[lastBlockFinal][BLOCK_SAMPLES - 1] = 0;
 }
 
-// Smoothly crossfade the end of the recorded loop into its beginning
-// to reduce a click when playback wraps. Uses descriptive names and
-// clamps the result to int16 range.
 void smoothLoopWrap() {
   if (blocksRecorded <= 1) return;
   const int CROSSFADE_SAMPLES = min(32, BLOCK_SAMPLES);
@@ -624,7 +561,6 @@ void smoothLoopWrap() {
   const int fadeCount = CROSSFADE_SAMPLES;
 
   for (int sample = 0; sample < fadeCount; ++sample) {
-    // mix parameter 0..1 where 0 -> only last block, 1 -> only first block
     float mixT = (float)sample / (float)(fadeCount - 1);
     float gainFirst = mixT;          // ramps up
     float gainLast  = 1.0f - mixT;   // ramps down
@@ -644,7 +580,7 @@ void smoothLoopWrap() {
   }
 }
 
-/* ---- Recording/Playback Control ---- */
+//  Recording/Playback Control 
 void startArmedRecord(){
   isPlaying = false;
   isRecording = false;
@@ -884,7 +820,7 @@ void stopSDPlay() {
   mix.gain(2, 0.0f);
 }
 
-// ---- Delete sample ----
+//  Delete sample 
 void deleteSample() {
   isRecording = false;
   isPlaying = false;
@@ -934,7 +870,7 @@ void patchWavSizes(FsFile &f, uint32_t dataBytes) {
   f.seek(40); f.write((uint8_t*)&dataBytes, 4);
 }
 
-// ---- SD playback (double-buffered) ----
+//  SD playback (double-buffered) 
 void refillIfNeeded() {
   if (!sdPlaying || !playFile) return;
 
@@ -1022,11 +958,8 @@ void queueFromBuffer() {
   }
 }
 
-/* ---- setup ---- */
+//  setup  
 void setup(){
-    // Long-press on menuBtnDown
-    // - In MODE_MENU: open Effects menu
-    // - In MODE_RAM : toggle overdub (RAM-only)
     menuBtnDown.onHold([](int){
       if (uiMode == MODE_MENU) {
         uiMode = MODE_EFFECTS_MENU;
@@ -1375,15 +1308,10 @@ if (!sdfs.begin(SdioConfig(FIFO_SDIO))) {
   drawMenu();
 }
 
-/* ---- loop ---- */
+//  loop 
 void loop(){
-  // Audio memory usage message
   static elapsedMillis ramTimer = 0;
   if (ramTimer > 2000) {
-    // Serial.print("AudioMemoryUsage: ");
-    // Serial.print(AudioMemoryUsage());
-    // Serial.print(" / ");
-    // Serial.println(AudioMemoryUsageMax());
     ramTimer = 0;
   }
   for (int i = 0; i < 7; ++i) buttonArray[i]->process();
@@ -1393,7 +1321,6 @@ void loop(){
   inputMix.gain(1, 1.0f); 
   sgtl5000.inputSelect(AUDIO_INPUT_LINEIN); 
 
-  // Always process SD playback, even in menu mode
   if (playFromSD && sdPlaying) {
     refillIfNeeded();
   int slots = playbackQueue.available();
@@ -1405,7 +1332,7 @@ void loop(){
 
   if (uiMode == MODE_MENU) {
     if (inPlaybackScreen) {
-      // Throttle playback overlay redraws to avoid constant drawing
+      // Throttle playback 
       static uint32_t lastPlayDraw = 0;
       static String lastPlayFile = "";
       if (playbackFile != lastPlayFile || millis() - lastPlayDraw > 1000) {
@@ -1678,14 +1605,12 @@ void loop(){
             // Mix input into current playhead block with feedback
             int targetBlock = blocksRecorded; // append if at end
             if (targetBlock >= MAX_BLOCKS) targetBlock = MAX_BLOCKS - 1;
-            // If we're still filling new blocks (appending), act like normal write
             if (blocksRecorded < MAX_BLOCKS && (blocksRecorded == 0 || loopPlayIndex >= blocksRecorded)) {
               memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
               blocksRecorded++;
               countsDirty = true;
               if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
             } else {
-              // Mix into existing block at position loopPlayIndex
               int mixBlock = loopPlayIndex % max(1, blocksRecorded);
               for (int i = 0; i < BLOCK_SAMPLES; ++i) {
                 int32_t existing = loopBuffer[mixBlock][i];

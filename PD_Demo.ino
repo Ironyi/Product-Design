@@ -24,8 +24,8 @@ float lineInGain = 0.0f;
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
 #include "BetterButton.h"
-#include <SD.h>          
-#define SD_CS 10         
+SdFs sdfs;
+bool sdfsReady = false;
 
 
 #include "status.h"
@@ -90,36 +90,43 @@ AudioConnection pc7(lowpassFX,0, i2sOut, 0);
 AudioConnection pc7b(lowpassFX,0, i2sOut, 1);
 AudioConnection pc8(inputMix, 0, peakL, 0);    
 
-// --- Polyphonic SD playback ---
-void startSDPolyPlay(const char* path1, const char* path2) {
-  // Queued SD playback is stopped
-  stopSDPlay();
-  // Stop voices
-  playSd1.stop();
-  playSd2.stop();
-  sdPolyPlaying = true;
-  polyMix.gain(0, 1.0f); // voice 1
-  polyMix.gain(1, 1.0f); // voice 2
-  polyMix.gain(2, 0.0f); // future use
-  polyMix.gain(3, 0.0f); // future use
-  // Mute dry and RAM loop
-  mix.gain(0, 0.0f); // dry muted
-  mix.gain(1, 0.0f); // RAM loop muted
-  mix.gain(2, 1.0f); // SD poly mix to main mix
-  delay(10);
-  playSd1.play(path1);
-  playSd2.play(path2);
+struct WavInfo {
+  uint32_t dataOffset = 0;
+  uint32_t dataBytes  = 0;
+  uint16_t channels   = 1;
+  uint32_t sampleRate = 44100;
+  uint16_t bits       = 16;
+  bool ok             = false;
+};
+
+WavInfo parseWavHeader(FsFile &f) {
+  WavInfo wi;
+  if (!f) return wi;
+  uint8_t hdr[44];
+  if (f.read(hdr, 44) != 44) { f.close(); return wi; }
+  if (memcmp(hdr+0,  "RIFF", 4) || memcmp(hdr+8, "WAVE", 4)) { f.close(); return wi; }
+  wi.channels   = *(uint16_t*)(hdr+22);
+  wi.sampleRate = *(uint32_t*)(hdr+24);
+  wi.bits       = *(uint16_t*)(hdr+34);
+  wi.dataBytes  = *(uint32_t*)(hdr+40);
+  wi.dataOffset = 44;
+  wi.ok = (wi.channels == 1 && wi.sampleRate == 44100 && wi.bits == 16 && wi.dataBytes > 0);
+  if (!wi.ok) f.close();
+  return wi;
 }
 
-void stopSDPolyPlay() {
-  if (!sdPolyPlaying) return;
-  playSd1.stop();
-  playSd2.stop();
-  sdPolyPlaying = false;
-  // restore mix routing
-  mix.gain(0, 1.0f);
-  mix.gain(1, 0.8f);
-  mix.gain(2, 0.0f);
+// Flush any queued buffers in playbackQueue by filling with silence.
+void flushPlaybackQueue() {
+  const int MAX_FLUSH_ITER = 4; 
+  int iter = 0;
+  while (iter < MAX_FLUSH_ITER && playbackQueue.available() > 0) {
+    int16_t *buf = playbackQueue.getBuffer();
+    if (!buf) break;
+    memset(buf, 0, 128 * sizeof(int16_t));
+    playbackQueue.playBuffer();
+    ++iter;
+    yield();
+  }
 }
 
 /* ---- Pins ---- */
@@ -171,9 +178,10 @@ bool loopCaptured = false;     // true after first loop is created
 bool overdubEnabled = false;   // toggle to layer on top of the loop
 float odInputGain = 0.8f;      // live input level into overdub
 float odFeedback  = 0.7f;      // how much of the existing loop remains
+volatile bool countsDirty = false;
 
 // ---- WAV Writer state ----
-File wavFile;
+FsFile wavFile;
 volatile uint32_t samplesWritten = 0;    
 bool isSDRecording = false; 
 
@@ -182,7 +190,7 @@ bool playFromSD = false;
 uint32_t sdBlocksToPlay = 0; 
 
 // ---- WAV Reader (double-buffered) ----
-File playFile; 
+FsFile playFile; 
 const uint32_t BUF_SAMPLES = 4096;       
 DMAMEM int16_t sdBufA[BUF_SAMPLES];
 DMAMEM int16_t sdBufB[BUF_SAMPLES];
@@ -221,6 +229,7 @@ int menuLength = 0;
 int menuIndex = 0;
 String currentPath = "/";
 
+
 // --- Playback & Menu screen state ---
 FXType sdPlayFX = FX_REVERB;
 bool sdPlayFXEnabled[FX_COUNT] = {true, true, true};
@@ -238,7 +247,7 @@ void drawPlaybackScreen() {
   tft.print("Playing: "); tft.print(playbackFile);
   // Waveform preview reenable later
   /*
-  File f = SD.open(playbackFile.c_str(), FILE_READ);
+  FsFile f = sdfs.open(playbackFile.c_str(), FILE_READ);
   if (f && f.size() > 44) {
     f.seek(44);
     const int previewSamples = 1024; // smaller to be safe
@@ -278,16 +287,18 @@ void drawPlaybackScreen() {
 
 void scanSDMenu(const String& path) {
   menuLength = 0;
-  File dir = SD.open(path.c_str());
+  FsFile dir = sdfs.open(path.c_str());
   if (!dir) {
     strcpy(menuItems[0], "<SD Error>");
     menuLength = 1;
     return;
   }
-  File entry;
+  FsFile entry;
   while ((entry = dir.openNextFile())) {
     if (menuLength >= MAX_MENU_ITEMS) break;
-    String name = entry.name();
+    char nameBuf[64];
+    entry.getName(nameBuf, sizeof(nameBuf));
+    String name = String(nameBuf);
     if (entry.isDirectory()) name += "/";
     strncpy(menuItems[menuLength], name.c_str(), 31);
     menuItems[menuLength][31] = '\0';
@@ -327,7 +338,7 @@ void drawMenu() {
   // Show preview for .WAV files, not folders
   if (!sel.endsWith("/") && sel.endsWith(".WAV")) {
     String fullPath = currentPath + sel;
-    File f = SD.open(fullPath.c_str(), FILE_READ);
+  FsFile f = sdfs.open(fullPath.c_str(), FILE_READ);
     if (f && f.size() > 44) {
       f.seek(44); // skip WAV header
       const int previewSamples = 1024;
@@ -452,11 +463,16 @@ void applyEffectsNow() {
     default: break;
   }
 
-  if (playFromSD && sdPlaying) {
-    mix.gain(0, 0.0f); 
-    mix.gain(1, 0.0f); 
-    mix.gain(2, 1.0f); 
-  }
+    if (sdPolyPlaying) {
+    mix.gain(0, 0.0f); // dry
+    mix.gain(1, 0.0f); // queue (RAM/SD mono)
+    mix.gain(2, 1.0f); // poly voices
+    } else {
+    // mono queue is audible
+    mix.gain(0, 0.0f);
+    mix.gain(1, 1.0f);
+    mix.gain(2, 0.0f);
+    }
 }
 
 void drawHeader(){
@@ -635,9 +651,13 @@ void startArmedRecord(){
   armedRecord = true;
   recordQueue.clear();
   if (!isSDRecording) {
-    blocksRecorded = 0;
-    memset(loopBuffer, 0, sizeof(loopBuffer));
-  playbackBlockIndex = 0;
+    // In normal RAM record mode we clear the buffer. In overdub mode we keep
+    // the existing loop so live input can layer on top while listening.
+    if (!overdubEnabled) {
+      blocksRecorded = 0;
+      memset(loopBuffer, 0, sizeof(loopBuffer));
+      playbackBlockIndex = 0;
+    }
   }
   if (isSDRecording) {
   mainMixer.gain(0, 0.0f); 
@@ -655,25 +675,38 @@ String nextRecFilename() {
   char fnameBuf[16];
   while (recIndex < 1000) {
     snprintf(fnameBuf, sizeof(fnameBuf), "/REC%03d.WAV", recIndex);
-    if (!SD.exists(fnameBuf)) return String(fnameBuf);
+  if (!sdfs.exists(fnameBuf)) return String(fnameBuf);
     recIndex++;
   }
   return String("/REC999.WAV");
 }
 
 void startSDRecord(const char* path) {
-  if (!isSDRecording) return; 
-  wavFile = SD.open(path, FILE_WRITE);
+  if (!isSDRecording) return;
+  if (!sdfsReady) {
+    return;
+  }
+  // Try common open modes; SdFs may require O_CREAT | O_WRITE
+  wavFile = sdfs.open(path, FILE_WRITE);
+  if (!wavFile) {
+    Serial.print("startSDRecord: FILE_WRITE open failed for "); Serial.println(path);
+    wavFile = sdfs.open(path, O_CREAT | O_WRITE);
+  }
   if (wavFile) {
+    Serial.print("startSDRecord: opened "); Serial.println(path);
     writeWavHeader(wavFile, 44100, 16, 1);
     samplesWritten = 0;
+  } else {
+    Serial.print("startSDRecord: could not open "); Serial.println(path);
   }
 }
 
 void stopSDRecord() {
   if (!isSDRecording || !wavFile) return;
+  Serial.print("stopSDRecord: samplesWritten="); Serial.println(samplesWritten);
   patchWavSizes(wavFile, samplesWritten * 2);
   wavFile.close();
+  Serial.println("stopSDRecord: wavFile closed");
 }
 
 void startRecordingNow(){
@@ -693,10 +726,12 @@ void startRecordingNow(){
     tft.print(lastRecFile);
   } else {
     // RAM mode: clear buffer and reset
-    mix.gain(0, 1.0f); 
-    blocksRecorded = 0;
-    loopPlayIndex = 0;
-    memset(loopBuffer, 0, sizeof(loopBuffer));
+    mix.gain(0, 1.0f);
+    if (!overdubEnabled) {
+      blocksRecorded = 0;
+      loopPlayIndex = 0;
+      memset(loopBuffer, 0, sizeof(loopBuffer));
+    }
   }
 }
 
@@ -728,7 +763,6 @@ void stopRecording() {
   drawStatus(current);
 }
 
-
 void startPlayback(){
   if (blocksRecorded <= 0) { current = ST_NOAUDIO; drawStatus(current); return; }
   loopPlayIndex = 0;
@@ -758,54 +792,96 @@ void handleSDPlaybackLoop() {
   }
 }
 
+// --- Polyphonic SD playback ---
+void startSDPolyPlay(const char* path1, const char* path2) {
+  if (!sdfsReady) { Serial.println("startSDPolyPlay: sdfs not ready"); return; }
+  // Queued SD playback is stopped
+  stopSDPlay();
+  // Stop voices
+  playSd1.stop();
+  playSd2.stop();
+  sdPolyPlaying = true;
+  polyMix.gain(0, 1.0f); // voice 1
+  polyMix.gain(1, 1.0f); // voice 2
+  polyMix.gain(2, 0.0f); // future use
+  polyMix.gain(3, 0.0f); // future use
+  // Mute RAM loop; keep dry/live path if overdubbing
+  mix.gain(0, overdubEnabled ? 1.0f : 0.0f);
+  mix.gain(1, 0.0f); // RAM loop muted
+  mix.gain(2, 1.0f); // SD poly mix to main mix
+  delay(10);
+  Serial.print("startSDPolyPlay: "); Serial.print(path1); Serial.print(" , "); Serial.println(path2);
+  playSd1.play(path1);
+  playSd2.play(path2);
+  delay(20);
+  Serial.print("playSd1.isPlaying="); Serial.println(playSd1.isPlaying());
+  Serial.print("playSd2.isPlaying="); Serial.println(playSd2.isPlaying());
+}
+
+void stopSDPolyPlay() {
+  if (!sdPolyPlaying) return;
+  playSd1.stop();
+  playSd2.stop();
+  sdPolyPlaying = false;
+  // restore mix routing
+  mix.gain(0, 1.0f);
+  mix.gain(1, 0.8f);
+  mix.gain(2, 0.0f);
+}
+
 void startSDPlay(const char* path) {
-  if (sdPlaying) return;
-  if (isRecording || armedRecord) stopRecording();
-  if (wavFile) stopSDRecord();
-  mix.gain(0, 0.0f); // dry muted
-  mix.gain(1, 1.0f); // loop path full volume
-  playFile = SD.open(path, FILE_READ);
+  stopSDPlay();                 // hard reset any prior state
+  flushPlaybackQueue();       
+  // If overdubbing is enabled, allow the dry/live input path through while SD plays
+  mix.gain(0, overdubEnabled ? 1.0f : 0.0f);
+  mix.gain(1, 1.0f);            // queue path full
+  mix.gain(2, 0.0f);            // poly path muted
+
+  playFile = sdfs.open(path, FILE_READ);
   if (!playFile) {
-    Serial.println("SD: Could not open file for playback");
-    sdPlaying = false;
-    playFromSD = false;
-    return;
+    Serial.println("SD: open failed");
+    sdPlaying = false; playFromSD = false; return;
   }
-  if (playFile.size() <= 44) {
-    Serial.println("SD: File too small or not a valid WAV");
-    playFile.close();
-    sdPlaying = false;
-    playFromSD = false;
-    return;
-  }
-  playFile.seek(44); // skip WAV header
 
-  // Set sdBlocksToPlay to file size in blocks
-  uint32_t dataBytes = playFile.size() - 44;
-  sdBlocksToPlay = dataBytes / (BLOCK_SAMPLES * sizeof(int16_t));
+  WavInfo wi = parseWavHeader(playFile);
+  if (!wi.ok) {
+    Serial.println("SD: unsupported WAV (need 44.1k mono 16-bit)");
+    sdPlaying = false; playFromSD = false; return;
+  }
+  Serial.print("SD WAV: sr="); Serial.print(wi.sampleRate);
+  Serial.print(" ch="); Serial.print(wi.channels);
+  Serial.print(" bits="); Serial.print(wi.bits);
+  Serial.print(" bytes="); Serial.println(wi.dataBytes);
+
+  // compute file length in queue blocks
+  sdBlocksToPlay = wi.dataBytes / (BLOCK_SAMPLES * sizeof(int16_t));
   if (sdBlocksToPlay < 1) sdBlocksToPlay = 1;
-  loopPlayIndex = 0;
 
-  // reset buffers
+  // reset double buffers
   rdIndexA = rdIndexB = 0;
   validA = validB = 0;
   bufAReady = bufBReady = false;
   useA = true;
+
+  flushPlaybackQueue();
+
   sdPlaying = true;
   playFromSD = true;
-  Serial.print("SD: Playing file, blocks=");
-  Serial.println(sdBlocksToPlay);
+  Serial.print("SD: play "); Serial.print(path);
+  Serial.print(" blocks="); Serial.println(sdBlocksToPlay);
 }
 
 void stopSDPlay() {
-  if (!sdPlaying) return;
-  playFile.close();
+  if (playFile) playFile.close();
   sdPlaying = false;
   playFromSD = false;
-  sdPolyPlaying = false;
-  mix.gain(0, 1.0f); // dry/live restored
-  mix.gain(1, 0.8f); // loop path back to default
-  mix.gain(2, 0.0f); // SD poly mix muted
+  bufAReady = bufBReady = false;
+  rdIndexA = rdIndexB = validA = validB = 0;
+  flushPlaybackQueue();     
+  // restore live and loop defaults
+  mix.gain(0, 1.0f);
+  mix.gain(1, 0.8f);
+  mix.gain(2, 0.0f);
 }
 
 // ---- Delete sample ----
@@ -827,7 +903,7 @@ void deleteSample() {
 }
 
 
-void writeWavHeader(File &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+void writeWavHeader(FsFile &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
   uint8_t hdr[44];
   uint32_t byteRate = sampleRate * channels * (bitsPerSample/8);
   uint16_t blockAlign = channels * (bitsPerSample/8);
@@ -851,7 +927,7 @@ void writeWavHeader(File &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16
   f.write(hdr, 44);
 }
 
-void patchWavSizes(File &f, uint32_t dataBytes) {
+void patchWavSizes(FsFile &f, uint32_t dataBytes) {
 
   uint32_t riffSize = 36 + dataBytes;
   f.seek(4);  f.write((uint8_t*)&riffSize, 4);
@@ -863,112 +939,109 @@ void refillIfNeeded() {
   if (!sdPlaying || !playFile) return;
 
   if (!bufAReady) {
-    int32_t bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * 2);
+    int32_t bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * sizeof(int16_t));
     if (bytesRead <= 0) {
       playFile.seek(44);
-      bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * 2);
+      bytesRead = playFile.read((uint8_t*)sdBufA, BUF_SAMPLES * sizeof(int16_t));
     }
-    validA = (uint32_t)bytesRead / 2;  
+    validA = (uint32_t)(bytesRead / sizeof(int16_t));
     rdIndexA = 0;
-    bufAReady = (validA > 0);
+    bool oldA = bufAReady;
+    bufAReady = (validA >= BLOCK_SAMPLES);
+    if (bytesRead <= 0) Serial.println("refillIfNeeded: bytesReadA<=0");
+    if (bufAReady && !oldA) {
+      Serial.print("refillIfNeeded: bufAReady validA="); Serial.println(validA);
+    }
   }
 
   if (!bufBReady) {
-    int32_t bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * 2);
+    int32_t bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * sizeof(int16_t));
     if (bytesRead <= 0) {
       playFile.seek(44);
-      bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * 2);
+      bytesRead = playFile.read((uint8_t*)sdBufB, BUF_SAMPLES * sizeof(int16_t));
     }
-    validB = (uint32_t)bytesRead / 2;
+    validB = (uint32_t)(bytesRead / sizeof(int16_t));
     rdIndexB = 0;
-    bufBReady = (validB > 0);
+    bool oldB = bufBReady;
+    bufBReady = (validB >= BLOCK_SAMPLES);
+    if (bytesRead <= 0) Serial.println("refillIfNeeded: bytesReadB<=0");
+    if (bufBReady && !oldB) {
+      Serial.print("refillIfNeeded: bufBReady validB="); Serial.println(validB);
+    }
   }
 }
 
+
 void queueFromBuffer() {
   static uint32_t sdPlayedBlockCount = 0;
-  if (!sdPlaying) {
-    sdPlayedBlockCount = 0;
-    return;
-  }
+  if (!sdPlaying) { sdPlayedBlockCount = 0; return; }
+
   int slots = playbackQueue.available();
-  while (slots-- > 0 && sdPlayedBlockCount < sdBlocksToPlay) {
+  while (slots-- > 0) {
     int16_t *destBuf = playbackQueue.getBuffer();
     if (!destBuf) break;
 
-    // Pick current source buffer
-    int16_t *sourceBuf;
-    uint32_t *readIndexPtr, *validSamplesPtr;
-    bool *bufferReadyPtr;
-    if (useA) {
-      sourceBuf = sdBufA;
-      readIndexPtr = (uint32_t*)&rdIndexA;
-      validSamplesPtr = (uint32_t*)&validA;
-      bufferReadyPtr = (bool*)&bufAReady;
-    } else {
-      sourceBuf = sdBufB;
-      readIndexPtr = (uint32_t*)&rdIndexB;
-      validSamplesPtr = (uint32_t*)&validB;
-      bufferReadyPtr = (bool*)&bufBReady;
-    }
+    // Choose buffer
+    int16_t *src;
+    uint32_t *idx, *valid;
+    bool *ready;
+    if (useA) { src = sdBufA; idx = (uint32_t*)&rdIndexA; valid = (uint32_t*)&validA; ready = (bool*)&bufAReady; }
+    else      { src = sdBufB; idx = (uint32_t*)&rdIndexB; valid = (uint32_t*)&validB; ready = (bool*)&bufBReady; }
 
-    // If current empty, switch and try the other
-    if (!*bufferReadyPtr || *readIndexPtr + BLOCK_SAMPLES > *validSamplesPtr) {
+    // If current is not ready
+    if (!*ready || (*idx + BLOCK_SAMPLES) > *valid) {
       useA = !useA;
-      if (useA) {
-        sourceBuf = sdBufA;
-        readIndexPtr = (uint32_t*)&rdIndexA;
-        validSamplesPtr = (uint32_t*)&validA;
-        bufferReadyPtr = (bool*)&bufAReady;
-      } else {
-        sourceBuf = sdBufB;
-        readIndexPtr = (uint32_t*)&rdIndexB;
-        validSamplesPtr = (uint32_t*)&validB;
-        bufferReadyPtr = (bool*)&bufBReady;
-      }
+      if (useA) { src = sdBufA; idx = (uint32_t*)&rdIndexA; valid = (uint32_t*)&validA; ready = (bool*)&bufAReady; }
+      else      { src = sdBufB; idx = (uint32_t*)&rdIndexB; valid = (uint32_t*)&validB; ready = (bool*)&bufBReady; }
 
-      if (!*bufferReadyPtr || *readIndexPtr + BLOCK_SAMPLES > *validSamplesPtr) {
-        // nothing ready yet
-        break;
-      }
-    }
-
-    // Only copy if there are enough samples
-    if (*readIndexPtr + BLOCK_SAMPLES <= *validSamplesPtr) {
-      memcpy(destBuf, sourceBuf + *readIndexPtr, BLOCK_SAMPLES * sizeof(int16_t));
-      *readIndexPtr += BLOCK_SAMPLES;
-    } else {
-      // Not enough samples left, fill with zeros
-      int remaining = *validSamplesPtr - *readIndexPtr;
-      if (remaining > 0) memcpy(destBuf, sourceBuf + *readIndexPtr, remaining * sizeof(int16_t));
-      memset(destBuf + remaining, 0, (BLOCK_SAMPLES - remaining) * sizeof(int16_t));
-      *readIndexPtr = *validSamplesPtr;
-    }
-
-    sdPlayedBlockCount++;
-    if (*readIndexPtr >= *validSamplesPtr) { *bufferReadyPtr = false; } 
+      if (!*ready || (*idx + BLOCK_SAMPLES) > *valid) {
+    memset(destBuf, 0, BLOCK_SAMPLES * sizeof(int16_t));
     playbackQueue.playBuffer();
-  }
-  if (sdPlayedBlockCount >= sdBlocksToPlay) {
-    // End of file reached
-    stopSDPlay();
-    sdPlayedBlockCount = 0;
-    playFromSD = false;
-    Serial.println("SD: Playback finished");
+    break;
+
+      }
+    }
+
+    // Copy one block
+    memcpy(destBuf, src + *idx, BLOCK_SAMPLES * sizeof(int16_t));
+    *idx += BLOCK_SAMPLES;
+    if (*idx >= *valid) *ready = false;
+
+    playbackQueue.playBuffer();
+    sdPlayedBlockCount++;
+
+    if (sdPlayedBlockCount >= sdBlocksToPlay) {
+      playFile.seek(44);
+      sdPlayedBlockCount = 0;
+      // mark both buffers not ready so refill repopulates
+      bufAReady = bufBReady = false;
+      rdIndexA = rdIndexB = validA = validB = 0;
+      useA = true;
+      break;
+    }
   }
 }
 
 /* ---- setup ---- */
 void setup(){
-    // Effects menu: triggered by holding menuBtnDown in menu mode
-  menuBtnDown.onHold([](int){
-    if (uiMode == MODE_MENU) {
-      uiMode = MODE_EFFECTS_MENU;
-      inEffectsMenu = true;
-      effectsMenuIndex = 0;
-      drawEffectsMenu();
-    }
-  }, 600);
+    // Long-press on menuBtnDown
+    // - In MODE_MENU: open Effects menu
+    // - In MODE_RAM : toggle overdub (RAM-only)
+    menuBtnDown.onHold([](int){
+      if (uiMode == MODE_MENU) {
+        uiMode = MODE_EFFECTS_MENU;
+        inEffectsMenu = true;
+        effectsMenuIndex = 0;
+        drawEffectsMenu();
+      } else if (uiMode == MODE_RAM) {
+        // Only allow overdub toggle while in RAM mode
+        overdubEnabled = !overdubEnabled;
+        tft.fillRect(0, 96, 128, 12, BLACK);
+        tft.setCursor(4, 98);
+        tft.setTextColor(overdubEnabled ? CYAN : RED);
+        tft.print("Overdub: "); tft.print(overdubEnabled ? "ON " : "OFF");
+      }
+    }, 800);
   menuBtnUp.onPress([](int){
     if (inPlaybackScreen) {
       inPlaybackScreen = false;
@@ -1099,7 +1172,9 @@ void setup(){
         if (!selName.endsWith("/")) {
           String fullPath1 = currentPath + selName;
       // ensure no poly voices are active
-      stopSDPolyPlay();
+  stopSDPolyPlay();
+  stopSDPlay();
+  flushPlaybackQueue();
       startSDPlay(fullPath1.c_str());
           current = ST_PLAYING;
           drawStatus(current);
@@ -1204,8 +1279,8 @@ void setup(){
       if (!sel.endsWith("/")) {
         // File: delete it
         String fullPath = currentPath + sel;
-        if (SD.exists(fullPath.c_str())) {
-          SD.remove(fullPath.c_str());
+        if (sdfs.exists(fullPath.c_str())) {
+          sdfs.remove(fullPath.c_str());
           tft.setCursor(4, 120);
           tft.setTextColor(RED);
           tft.print("Deleted: ");
@@ -1229,7 +1304,8 @@ void setup(){
     armedRecord = false;
     stopSDRecord();
     stopSDPlay();
-    stopPlayback();
+  stopPlayback();
+  flushPlaybackQueue();
     blocksRecorded = 0;
     loopPlayIndex = 0;
     memset(loopBuffer, 0, sizeof(loopBuffer));
@@ -1290,9 +1366,12 @@ void setup(){
   pinMode(CLIP_LED_PIN, OUTPUT);
   digitalWrite(CLIP_LED_PIN, LOW);
 
-if (!SD.begin(SD_CS)) {
-  tft.setCursor(4, 80); tft.setTextColor(RED); tft.println("SD init failed");   //show SD init failure on screen
+if (!sdfs.begin(SdioConfig(FIFO_SDIO))) {
+  tft.setCursor(4, 80); tft.setTextColor(RED); tft.println("SDIO init failed");
+} else {
+  sdfsReady = true;
 }
+
   drawMenu();
 }
 
@@ -1301,10 +1380,10 @@ void loop(){
   // Audio memory usage message
   static elapsedMillis ramTimer = 0;
   if (ramTimer > 2000) {
-    Serial.print("AudioMemoryUsage: ");
-    Serial.print(AudioMemoryUsage());
-    Serial.print(" / ");
-    Serial.println(AudioMemoryUsageMax());
+    // Serial.print("AudioMemoryUsage: ");
+    // Serial.print(AudioMemoryUsage());
+    // Serial.print(" / ");
+    // Serial.println(AudioMemoryUsageMax());
     ramTimer = 0;
   }
   for (int i = 0; i < 7; ++i) buttonArray[i]->process();
@@ -1321,19 +1400,6 @@ void loop(){
     int toQueue = min(slots, 8); 
     while (toQueue-- > 0 && slots-- > 0) {
       queueFromBuffer();
-    }
-    // More throttling debugging
-    static uint32_t lastDbg = 0;
-    if (millis() - lastDbg > 500) {
-      Serial.print("SDPlay: validA="); Serial.print(validA);
-      Serial.print(" rdIndexA="); Serial.print(rdIndexA);
-      Serial.print(" bufAReady="); Serial.print(bufAReady);
-      Serial.print(" | validB="); Serial.print(validB);
-      Serial.print(" rdIndexB="); Serial.print(rdIndexB);
-      Serial.print(" bufBReady="); Serial.print(bufBReady);
-      Serial.print(" | AudioMemoryUsage: "); Serial.print(AudioMemoryUsage());
-      Serial.print(" / "); Serial.println(AudioMemoryUsageMax());
-      lastDbg = millis();
     }
   }
 
@@ -1537,6 +1603,10 @@ void loop(){
       if (current == ST_RECORDED || current == ST_PLAYING) {
         drawWaveform();
       }
+      if (countsDirty) {
+        drawCounts(blocksRecorded);
+        countsDirty = false;
+      }
       uiTick = 0;
     }
   }
@@ -1555,15 +1625,35 @@ void loop(){
               wavFile.write((const uint8_t*)b, BLOCK_SAMPLES * sizeof(int16_t));
               samplesWritten += BLOCK_SAMPLES;
               blocksRecorded++;
-              drawCounts(blocksRecorded);
+              countsDirty = true;
               yield();
               if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
             }
-          } else if (blocksRecorded < MAX_BLOCKS) {
-            memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
-            blocksRecorded++;
-            drawCounts(blocksRecorded);
-            if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+          } else {
+            if (overdubEnabled) {
+              // Mix into current playhead block
+              int mixBlock = loopPlayIndex % max(1, blocksRecorded);
+              if (blocksRecorded == 0) {
+                memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+                blocksRecorded++;
+                countsDirty = true;
+              } else {
+                for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+                  int32_t existing = loopBuffer[mixBlock][i];
+                  int32_t in = b[i];
+                  int32_t mixed = (int32_t)(existing * odFeedback + in * odInputGain);
+                  if (mixed > 32767) mixed = 32767;
+                  else if (mixed < -32768) mixed = -32768;
+                  loopBuffer[mixBlock][i] = (int16_t)mixed;
+                }
+                countsDirty = true;
+              }
+            } else if (blocksRecorded < MAX_BLOCKS) {
+              memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+              blocksRecorded++;
+              countsDirty = true;
+              if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+            }
           }
         }
   recordQueue.freeBuffer();
@@ -1575,20 +1665,45 @@ void loop(){
         if (isSDRecording) {
           // SD mode: write to SD only
           if (wavFile && blocksRecorded < sdRecMaxBlocks) {
-            wavFile.write((const uint8_t*)b, BLOCK_SAMPLES * sizeof(int16_t));
+              wavFile.write((const uint8_t*)b, BLOCK_SAMPLES * sizeof(int16_t));
             samplesWritten += BLOCK_SAMPLES;
             blocksRecorded++;
-            drawCounts(blocksRecorded);
+            countsDirty = true;
             yield(); // allow UI and other tasks to run
             if (blocksRecorded >= sdRecMaxBlocks) { stopRecording(); break; }
           }
         } else {
           // RAM mode: store in RAM only
-          if (blocksRecorded < MAX_BLOCKS) {
-            memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
-            blocksRecorded++;
-            drawCounts(blocksRecorded);
-            if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+          if (overdubEnabled) {
+            // Mix input into current playhead block with feedback
+            int targetBlock = blocksRecorded; // append if at end
+            if (targetBlock >= MAX_BLOCKS) targetBlock = MAX_BLOCKS - 1;
+            // If we're still filling new blocks (appending), act like normal write
+            if (blocksRecorded < MAX_BLOCKS && (blocksRecorded == 0 || loopPlayIndex >= blocksRecorded)) {
+              memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+              blocksRecorded++;
+              countsDirty = true;
+              if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+            } else {
+              // Mix into existing block at position loopPlayIndex
+              int mixBlock = loopPlayIndex % max(1, blocksRecorded);
+              for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+                int32_t existing = loopBuffer[mixBlock][i];
+                int32_t in = b[i];
+                int32_t mixed = (int32_t)(existing * odFeedback + in * odInputGain);
+                if (mixed > 32767) mixed = 32767;
+                else if (mixed < -32768) mixed = -32768;
+                loopBuffer[mixBlock][i] = (int16_t)mixed;
+              }
+              countsDirty = true;
+            }
+          } else {
+            if (blocksRecorded < MAX_BLOCKS) {
+              memcpy(loopBuffer[blocksRecorded], b, BLOCK_SAMPLES * sizeof(int16_t));
+              blocksRecorded++;
+              countsDirty = true;
+              if (blocksRecorded >= MAX_BLOCKS) { stopRecording(); break; }
+            }
           }
         }
   recordQueue.freeBuffer();
@@ -1621,17 +1736,7 @@ void loop(){
     while (toQueue-- > 0 && slots-- > 0) {
       queueFromBuffer();
     }
-    // Debug: print buffer status 
-    Serial.print("SDPlay: validA="); Serial.print(validA);
-    Serial.print(" rdIndexA="); Serial.print(rdIndexA);
-    Serial.print(" bufAReady="); Serial.print(bufAReady);
-    Serial.print(" | validB="); Serial.print(validB);
-    Serial.print(" rdIndexB="); Serial.print(rdIndexB);
-    Serial.print(" bufBReady="); Serial.print(bufBReady);
-    Serial.print(" | AudioMemoryUsage: "); Serial.print(AudioMemoryUsage());
-    Serial.print(" / "); Serial.println(AudioMemoryUsageMax());
   }
-
   menuBtnUp.process();
   menuBtnDown.process();
 }

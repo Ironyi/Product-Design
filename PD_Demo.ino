@@ -42,8 +42,8 @@ AudioFilterBiquad    hp;
 AudioRecordQueue     recordQueue;
 AudioPlayQueue       playQueue;
 AudioPlaySdWav       sd1, sd2;
-AudioMixer4          sdMix;      // mix SD voices
-AudioMixer4          mainMix;    // final mix before FX
+AudioMixer4          sdMix;      
+AudioMixer4          mainMix;     
 AudioEffectFreeverb  reverb;
 AudioEffectBitcrusher bitcrush;
 AudioFilterBiquad    lowpass;
@@ -176,7 +176,6 @@ DMAMEM int16_t sdBufB[BUF_SAMPLES];
 volatile uint32_t rdIndexA = 0, validA = 0;
 volatile uint32_t rdIndexB = 0, validB = 0; 
 volatile bool bufAReady = false, bufBReady = false;
-// Aliases for clearer usage
 volatile uint32_t& sdReadIndexA = rdIndexA;
 volatile uint32_t& sdValidSamplesA = validA;
 volatile uint32_t& sdReadIndexB = rdIndexB;
@@ -209,7 +208,7 @@ int menuIndex = 0;
 String currentPath = "/";
 
 
-// --- Playback & Menu screen state ---
+//  Playback & Menu screen state 
 FXType sdPlayFX = FX_REVERB;
 bool sdPlayFXEnabled[FX_COUNT] = {true, true, true};
 float sdPlayFXDepth[FX_COUNT] = {0.3f, 0.3f, 0.3f};
@@ -219,7 +218,7 @@ const char* effectsMenuItems[FX_COUNT] = { "Reverb", "Bitcrush", "Lowpass" };
 bool inPlaybackScreen = false;
 String playbackFile = "";
 
-// --- Playback screen drawing ---
+//  Playback screen drawing 
 void drawPlaybackScreen() {
   tft.fillRect(0, 20, 128, 108, BLACK);
   tft.setTextColor(GREEN); tft.setCursor(4, 22);
@@ -723,7 +722,7 @@ void handleSDPlaybackLoop() {
   }
 }
 
-// --- Polyphonic SD playback ---
+//  Polyphonic SD playback 
 void startSDPolyPlay(const char* path1, const char* path2) {
   if (!sdfsReady) { Serial.println("startSDPolyPlay: sdfs not ready"); return; }
   // Queued SD playback is stopped
@@ -909,14 +908,12 @@ void queueFromBuffer() {
     int16_t *destBuf = playbackQueue.getBuffer();
     if (!destBuf) break;
 
-    // Choose buffer
     int16_t *src;
     uint32_t *idx, *valid;
     bool *ready;
     if (useA) { src = sdBufA; idx = (uint32_t*)&rdIndexA; valid = (uint32_t*)&validA; ready = (bool*)&bufAReady; }
     else      { src = sdBufB; idx = (uint32_t*)&rdIndexB; valid = (uint32_t*)&validB; ready = (bool*)&bufBReady; }
 
-    // If current is not ready
     if (!*ready || (*idx + BLOCK_SAMPLES) > *valid) {
       useA = !useA;
       if (useA) { src = sdBufA; idx = (uint32_t*)&rdIndexA; valid = (uint32_t*)&validA; ready = (bool*)&bufAReady; }
@@ -930,7 +927,6 @@ void queueFromBuffer() {
       }
     }
 
-    // Copy one block
     memcpy(destBuf, src + *idx, BLOCK_SAMPLES * sizeof(int16_t));
     *idx += BLOCK_SAMPLES;
     if (*idx >= *valid) *ready = false;
@@ -941,7 +937,6 @@ void queueFromBuffer() {
     if (sdPlayedBlockCount >= sdBlocksToPlay) {
       playFile.seek(44);
       sdPlayedBlockCount = 0;
-      // mark both buffers not ready so refill repopulates
       bufAReady = bufBReady = false;
       rdIndexA = rdIndexB = validA = validB = 0;
       useA = true;
@@ -959,7 +954,6 @@ void setup(){
         effectsMenuIndex = 0;
         drawEffectsMenu();
       } else if (uiMode == MODE_RAM) {
-        // Only allow overdub toggle while in RAM mode
         overdubEnabled = !overdubEnabled;
         tft.fillRect(0, 96, 128, 12, BLACK);
         tft.setCursor(4, 98);

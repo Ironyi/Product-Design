@@ -1,7 +1,6 @@
-enum FXType { FX_REVERB, FX_BITCRUSH, FX_LOWPASS, FX_COUNT };
+enum FXType { FX_TAPE_SPEED, FX_TREMOLO, FX_LOWPASS, FX_REVERB, FX_COUNT };
 FXType currentFX = FX_REVERB;
 float reverbDepth = 0.3f;
-float bitcrushDepth = 0.3f;
 float lowpassDepth = 0.3f;
 enum PotFxMode { POTFX_REVERB_LP, POTFX_TREMOLO, POTFX_TAPE_SPEED, POTFX_MODE_COUNT };
 PotFxMode potFxMode = POTFX_REVERB_LP;
@@ -12,7 +11,7 @@ float tremoloRate  = 5.0f;
 float tremoloPhaseA = 0.0f;
 float tremoloPhaseB = 0.0f;
 float tapeSpeedRate = 1.0f;
-enum UIMode { MODE_RAM, MODE_SDREC, MODE_MENU, MODE_EFFECTS_MENU };
+enum UIMode { MODE_RAM, MODE_SDREC, MODE_MENU };
 UIMode uiMode = MODE_RAM;
 
 float usbGain = 1.0f;
@@ -82,10 +81,10 @@ AudioMixer4         polyMix;
 AudioMixer4&        sdPolyMixer = polyMix;
 AudioMixer4         mix;
 AudioMixer4&        mainMixer = mix;
+AudioMixer4         outMix;
 bool sdPolyPlaying = false;
 bool sdPolyMode = true;
 AudioEffectFreeverb reverb;
-AudioEffectBitcrusher bitcrushFX;
 AudioFilterBiquad lowpassFX;
 AudioOutputI2S      i2sOut;
 AudioAnalyzePeak    peakL;
@@ -101,7 +100,9 @@ AudioConnection pcSd1(playSd1, 0, polyMix, 0);
 AudioConnection pcSd2(playSd2, 0, polyMix, 1);
 AudioConnection pcPolyMix(polyMix, 0, mix, 2);
 AudioConnection pcMixToReverb(mix, 0, reverb, 0);
-AudioConnection pc6(reverb,0, lowpassFX, 0);
+AudioConnection pcDry(mix, 0, outMix, 0);
+AudioConnection pcWet(reverb, 0, outMix, 1);
+AudioConnection pcOutMixToLP(outMix, 0, lowpassFX, 0);
 AudioConnection pc7(lowpassFX,0, i2sOut, 0);
 AudioConnection pc7b(lowpassFX,0, i2sOut, 1);
 AudioConnection pc8(inputMix, 0, peakL, 0);
@@ -145,6 +146,7 @@ const int PIN_REC_BTN    = 33;
 const int PIN_PLAY_BTN   = 34;
 const int PIN_LOOP_BTN   = 30;
 const int PIN_SELECT_BTN = 29;
+const int PIN_OD_BTN     = 35;
 
 const int PIN_ENC_A  = 27;
 const int PIN_ENC_B  = 28;
@@ -176,9 +178,10 @@ BetterButton selectButton(PIN_SELECT_BTN, 3, INPUT_PULLUP);
 BetterButton sampleBtn1(PIN_SMP_BTN_1, 4, INPUT_PULLUP);
 BetterButton sampleBtn2(PIN_SMP_BTN_2, 5, INPUT_PULLUP);
 BetterButton encoderBtn(PIN_ENC_SW, 6, INPUT_PULLUP);
+BetterButton overdubButton(PIN_OD_BTN, 7, INPUT_PULLUP);
 
 BetterButton* buttonArray[] = { &recButton, &playButton, &loopButton, &selectButton,
-                                &sampleBtn1, &sampleBtn2, &encoderBtn };
+                                &sampleBtn1, &sampleBtn2, &encoderBtn, &overdubButton };
 const size_t BUTTON_COUNT = sizeof(buttonArray) / sizeof(buttonArray[0]);
 
 volatile long encoderPos = 0;
@@ -218,7 +221,7 @@ int readEncoderDelta() {
     }
   }
   lastState = state;
-  delta = -delta;          
+  delta = -delta;          // flip direction to match physical rotation
   encoderPos += delta;
   return delta;
 }
@@ -236,11 +239,13 @@ static int loopPlayIndex = 0;
 static int& playbackBlockIndex = loopPlayIndex;
 int16_t waveformPeak = 512;
 float   waveformGain = 1.0f;
+float tremoloPhaseSD = 0.0f;
 
 const uint32_t MAX_CLIP_SAMPLES = 44100UL * 30UL;
 EXTMEM int16_t clipA[MAX_CLIP_SAMPLES];
 EXTMEM int16_t clipB[MAX_CLIP_SAMPLES];
 uint32_t clipSamplesA = 0, clipSamplesB = 0;
+uint32_t overdubPosA = 0, overdubPosB = 0;
 float clipGainA = 1.0f;
 float clipGainB = 1.0f;
 bool clipReadyA = false, clipReadyB = false;
@@ -340,7 +345,6 @@ bool overdubEnabled = false;
 float odInputGain = 0.8f;
 float odFeedback  = 0.7f;
 volatile bool countsDirty = false;
-bool saveClipMode = false;
 bool pausedPlayback = false;
 
 FsFile wavFile;
@@ -353,6 +357,8 @@ uint32_t bounceSamples = 0;
 
 bool playFromSD = false;
 uint32_t sdBlocksToPlay = 0;
+uint32_t sdBlocksBase = 0;
+float sdPosFrac = 0.0f;
 
 FsFile playFile;
 const uint32_t BUF_SAMPLES = 4096;
@@ -374,7 +380,7 @@ bool& sdPlaybackActive = sdPlaying;
 const int CLIP_LED_PIN = 2;
 AudioAnalyzePeak peakOut;
 bool clipLatched = false;
-AudioConnection pcOutMeter(reverb, 0, peakOut, 0);
+AudioConnection pcOutMeter(lowpassFX, 0, peakOut, 0);
 
 
 
@@ -392,11 +398,8 @@ String currentPath = "/";
 
 
 FXType sdPlayFX = FX_REVERB;
-bool sdPlayFXEnabled[FX_COUNT] = {true, true, true};
-float sdPlayFXDepth[FX_COUNT] = {0.3f, 0.3f, 0.3f};
-bool inEffectsMenu = false;
-int effectsMenuIndex = 0;
-const char* effectsMenuItems[FX_COUNT] = { "Reverb", "Bitcrush", "Lowpass" };
+bool sdPlayFXEnabled[FX_COUNT] = {true, true, true, true};
+float sdPlayFXDepth[FX_COUNT] = {0.333f, 0.0f, 0.0f, 0.3f};
 bool inPlaybackScreen = false;
 String playbackFile = "";
 
@@ -511,103 +514,15 @@ void drawMenu() {
   }
 }
 
-// FX menu + visualization
-void drawEffectsMenu() {
-  tft.fillRect(0, 20, 128, 108, BLACK);
-  tft.setTextColor(YELLOW); tft.setCursor(4, 22);
-  tft.print("Effects");
-  int y = 40;
-  for (int i = 0; i < FX_COUNT; ++i) {
-    if (i == effectsMenuIndex) {
-      tft.fillRect(0, y-2, 64, 14, BLUE);
-      tft.setTextColor(WHITE, BLUE);
-    } else {
-      tft.setTextColor(WHITE, BLACK);
-    }
-    tft.setCursor(4, y);
-    tft.print(effectsMenuItems[i]);
-    y += 16;
-  }
-  tft.setTextColor(sdPlayFXEnabled[effectsMenuIndex] ? GREEN : RED);
-  tft.setCursor(4, 100);
-  tft.print(sdPlayFXEnabled[effectsMenuIndex] ? "Enabled" : "Disabled");
-
-
-  tft.fillRect(64, 24, 64, 72, BLACK);
-  float potVal = readPotInv(POT_FX);
-  switch (effectsMenuIndex) {
-    case FX_REVERB: {
-      int knobCenterX = 64 + 32, knobCenterY = 60, knobRadius = 20;
-  tft.drawCircle(knobCenterX, knobCenterY, knobRadius, GRAY);
-  float angle = 3.14159f * (0.75f + 1.5f * potVal);
-  int knobHandleX = knobCenterX + (int)(knobRadius * cos(angle));
-  int knobHandleY = knobCenterY + (int)(knobRadius * sin(angle));
-  tft.drawLine(knobCenterX, knobCenterY, knobHandleX, knobHandleY, CYAN);
-  tft.setTextColor(CYAN); tft.setCursor(knobCenterX-20, knobCenterY+36);
-  tft.print("Depth: "); tft.print(potVal,2);
-      break;
-    }
-    case FX_BITCRUSH: {
-      int bars = 8 + (int)(potVal * 8.0f);
-      int barX = 68, barY = 40;
-      for (int barIdx = 0; barIdx < 16; ++barIdx) {
-        int barHeight = 4 + barIdx;
-        uint16_t col = (barIdx < bars) ? CYAN : GRAY;
-        tft.fillRect(barX + barIdx*3, barY + 32 - barHeight, 2, barHeight, col);
-      }
-      tft.setTextColor(CYAN); tft.setCursor(barX, barY+48);
-      tft.print("Bits: "); tft.print(bars);
-      break;
-    }
-    case FX_LOWPASS: {
-  int curveBaseY = 90, curveWidth = 56, curveHeight = 24;
-      float cutoff = 12000.0f - potVal * (12000.0f - 500.0f);
-      for (int curveX = 0; curveX < curveWidth; ++curveX) {
-        float freq = 500.0f + (curveX/(float)curveWidth)*(12000.0f-500.0f);
-        float curveY = curveHeight * exp(-freq/cutoff);
-        tft.drawPixel(64 + curveX, curveBaseY - (int)curveY, CYAN);
-      }
-    tft.setTextColor(CYAN); tft.setCursor(66, curveBaseY+16);
-      tft.print("Cutoff: "); tft.print((int)cutoff);
-      break;
-    }
-    default: break;
-  }
-}
-
-// Apply FX pot values
-void applyEffectsNow() {
-  reverb.roomsize(reverbDepth > 0.01f ? (reverbDepth * 0.95f) : 0.01f);
-  float minCutoff = 500.0f;
-  float maxCutoff = 12000.0f;
-  float cutoff = maxCutoff - lowpassDepth * (maxCutoff - minCutoff);
-  if (lowpassDepth < 0.01f) cutoff = maxCutoff;
-  lowpassFX.setLowpass(0, cutoff, 0.707f);
-}
-
 void drawHeader(){
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   tft.fillScreen(BLACK);
-  tft.setTextColor(WHITE); tft.setTextSize(1);
-  tft.setCursor(4,4); tft.println("USB Looper");
-  tft.drawLine(0,16,127,16,GRAY);
-  tft.setTextColor(YELLOW);
-  tft.setCursor(80, 4);
-  switch (uiMode) {
-  case MODE_RAM:   tft.print("RAM Rec"); break;
-  case MODE_SDREC: tft.print("SD Rec"); break;
-  case MODE_MENU:  tft.print("MENU");   break;
-  case MODE_EFFECTS_MENU: tft.print("FX Menu"); break;
-  default: break;
-}
-  tft.setTextColor(playFromSD ? CYAN : YELLOW);
-  tft.setCursor(80, 12); tft.print(playFromSD ? "SDPlay" : "RAMPlay");
   SPI.endTransaction();
 }
 void drawStatus(Status s){
   if (s == lastDrawn) return;
   lastDrawn = s;
-  tft.fillRect(0,20,128,18,BLACK); tft.setCursor(4,22);
+  tft.fillRect(0,0,128,18,BLACK); tft.setCursor(4,2);
   switch(s){
     case ST_READY:     tft.setTextColor(WHITE);  tft.print("Status: Ready"); break;
     case ST_ARMED:     tft.setTextColor(YELLOW); tft.print("Status: Armed (waiting)"); break;
@@ -787,15 +702,16 @@ void startSDRecord(const char* path) {
   if (!sdfsReady) {
     return;
   }
-  wavFile = sdfs.open(path, FILE_WRITE);
-  if (!wavFile) {
-    Serial.print("startSDRecord: FILE_WRITE open failed for "); Serial.println(path);
-    wavFile = sdfs.open(path, O_CREAT | O_WRITE);
-  }
+  wavFile = sdfs.open(path, O_WRITE | O_CREAT | O_TRUNC);
   if (wavFile) {
     Serial.print("startSDRecord: opened "); Serial.println(path);
-    writeWavHeader(wavFile, 44100, 16, 1);
-    samplesWritten = 0;
+    int written = writeWavHeader(wavFile, 44100, 16, 1);
+    if (written != 44) {
+      Serial.println("startSDRecord: header write failed");
+      wavFile.close();
+    } else {
+      samplesWritten = 0;
+    }
   } else {
     Serial.print("startSDRecord: could not open "); Serial.println(path);
   }
@@ -892,6 +808,7 @@ void startSDPolyPlay(const char* path1, const char* path2) {
   playSd1.play(path1);
   playSd2.play(path2);
   delay(20);
+  // Force gains in case anything reset post-start
   polyMix.gain(0, 1.0f);
   polyMix.gain(1, 1.0f);
   mix.gain(2, 1.0f);
@@ -941,6 +858,8 @@ void startSDPlay(const char* path) {
 
   sdBlocksToPlay = wi.dataBytes / (BLOCK_SAMPLES * sizeof(int16_t));
   if (sdBlocksToPlay < 1) sdBlocksToPlay = 1;
+  sdBlocksBase = sdBlocksToPlay;
+  sdPosFrac = 0.0f;
 
   rdIndexA = rdIndexB = 0;
   validA = validB = 0;
@@ -959,6 +878,7 @@ void stopSDPlay() {
   if (playFile) playFile.close();
   sdPlaying = false;
   playFromSD = false;
+  sdPosFrac = 0.0f;
   bufAReady = bufBReady = false;
   rdIndexA = rdIndexB = validA = validB = 0;
   flushPlaybackQueue();
@@ -985,7 +905,7 @@ void deleteSample() {
 }
 
 
-void writeWavHeader(FsFile &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+int writeWavHeader(FsFile &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
   uint8_t hdr[44];
   uint32_t byteRate = sampleRate * channels * (bitsPerSample/8);
   uint16_t blockAlign = channels * (bitsPerSample/8);
@@ -1003,7 +923,7 @@ void writeWavHeader(FsFile &f, uint32_t sampleRate, uint16_t bitsPerSample, uint
   memcpy(hdr+36, "data", 4);
   *(uint32_t*)(hdr+40) = 0;
 
-  f.write(hdr, 44);
+  return f.write(hdr, 44);
 }
 
 void patchWavSizes(FsFile &f, uint32_t dataBytes) {
@@ -1014,14 +934,13 @@ void patchWavSizes(FsFile &f, uint32_t dataBytes) {
 }
 
 // Bounce RAM clip to SD with FX
-void startBounceSave(ClipSlot slot) {
-  if (!sdfsReady) return;
-  if (!sdfs.begin(SdioConfig(FIFO_SDIO))) return;
-  if (bounceActive) return;
+bool startBounceSave(ClipSlot slot) {
+  if (!sdfsReady) { writeFooter("SD not ready", RED); return false; }
+  if (bounceActive) return false;
 
   const bool targetA = (slot == CLIP_A && clipReadyA);
   const bool targetB = (slot == CLIP_B && clipReadyB);
-  if (!targetA && !targetB) return;
+  if (!targetA && !targetB) { writeFooter("No clip", RED); return false; }
 
   const char* prefix = targetA ? "/CLIPA" : "/CLIPB";
   char fname[20];
@@ -1030,12 +949,13 @@ void startBounceSave(ClipSlot slot) {
     snprintf(fname, sizeof(fname), "%s%03d.WAV", prefix, i);
     if (!sdfs.exists(fname)) { found = true; break; }
   }
-  if (!found) return;
+  if (!found) { writeFooter("No file slot", RED); return false; }
 
-  bounceFile = sdfs.open(fname, FILE_WRITE);
-  if (!bounceFile) return;
+  bounceFile = sdfs.open(fname, O_WRITE | O_CREAT | O_TRUNC);
+  if (!bounceFile) { writeFooter("Open fail", RED); return false; }
 
-  writeWavHeader(bounceFile, 44100, 16, 1);
+  int written = writeWavHeader(bounceFile, 44100, 16, 1);
+  if (written != 44) { writeFooter("Header fail", RED); bounceFile.close(); return false; }
   bounceSamples = 0;
   bounceSlot = slot;
   bounceActive = true;
@@ -1064,6 +984,7 @@ void startBounceSave(ClipSlot slot) {
   tft.setTextColor(YELLOW);
   tft.print("Bounce -> ");
   tft.print(fname);
+  return true;
 }
 
 // Refill SD buffers
@@ -1133,8 +1054,34 @@ void queueFromBuffer() {
       }
     }
 
-    memcpy(destBuf, src + *idx, BLOCK_SAMPLES * sizeof(int16_t));
+    float step = 1.0f;
+    float basePos = (float)(*idx);
+    for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+      float pos = basePos + step * (float)i;
+      int16_t out = 0;
+      if (pos + 1.0f < (float)(*valid)) {
+        uint32_t base = (uint32_t)pos;
+        float frac = pos - (float)base;
+        int32_t a = src[base];
+        int32_t b = src[base + 1];
+        int32_t s = (int32_t)((1.0f - frac) * a + frac * b);
+        out = (int16_t)s;
+      }
+      float depth = tremoloDepth;
+      if (depth > 0.0f) {
+        float lfo = 0.5f + 0.5f * sinf(tremoloPhaseSD);
+        float gain = 1.0f - depth + depth * lfo;
+        int32_t s = (int32_t)(out * gain);
+        if (s > 32767) s = 32767;
+        else if (s < -32768) s = -32768;
+        out = (int16_t)s;
+        tremoloPhaseSD += 2.0f * 3.14159265f * (tremoloRate / 44100.0f);
+        if (tremoloPhaseSD > 6.2831853f) tremoloPhaseSD -= 6.2831853f;
+      }
+      destBuf[i] = out;
+    }
     *idx += BLOCK_SAMPLES;
+    sdPosFrac = 0.0f;
     if (*idx >= *valid) *ready = false;
 
     playbackQueue.playBuffer();
@@ -1160,12 +1107,7 @@ void setup(){
   lastEncState = (digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B);
 
   encoderBtn.onHold([](int){
-    if (uiMode == MODE_MENU) {
-      uiMode = MODE_EFFECTS_MENU;
-      inEffectsMenu = true;
-      effectsMenuIndex = 0;
-      drawEffectsMenu();
-    } else if (uiMode == MODE_RAM) {
+    if (uiMode == MODE_RAM) {
       overdubEnabled = !overdubEnabled;
       tft.fillRect(0, 96, 128, 12, BLACK);
       tft.setCursor(4, 98);
@@ -1189,14 +1131,6 @@ void setup(){
       return;
     }
     if (inPlaybackScreen) {
-      return;
-    }
-    if (uiMode == MODE_EFFECTS_MENU) {
-      sdPlayFX = (FXType)effectsMenuIndex;
-      uiMode = MODE_MENU;
-      inEffectsMenu = false;
-      applyEffectsNow();
-      drawMenu();
       return;
     }
     if (uiMode == MODE_MENU) {
@@ -1265,16 +1199,9 @@ void setup(){
       drawMenu();
       return;
     }
-
-    if (uiMode == MODE_RAM && saveClipMode) {
-      startBounceSave(CLIP_A);
-      saveClipMode = false;
-      return;
-    }
-
     if (uiMode != MODE_RAM) return;
 
-    if (!isRecording && !armedRecord && clipReadyA) {
+  if (!overdubEnabled && !isRecording && !armedRecord && clipReadyA) {
       if (tapBpm > 0.0f && msPerBeat > 0) {
         uint32_t now = millis();
         uint32_t mod = now % msPerBeat;
@@ -1300,23 +1227,27 @@ void setup(){
 
     if (isRecording || armedRecord) stopRecording();
     recordSlot    = CLIP_A;
-    clipSamplesA  = 0;
-    clipReadyA    = false;
+    if (overdubEnabled && clipReadyA) {
+      overdubPosA = 0;
+    } else {
+      clipSamplesA  = 0;
+      clipReadyA    = false;
+      overdubPosA   = 0;
+    }
     startArmedRecord();
     tft.fillRect(0, 96, 128, 12, BLACK);
     tft.setCursor(4, 98); tft.setTextColor(CYAN);
     tft.print("Rec Smp 1");
   });
+  sampleBtn1.onHold([](int){
+    if (uiMode != MODE_RAM) return;
+    if (isRecording || armedRecord) stopRecording();
+    if (isPlaying) stopPlayback();
+    startBounceSave(CLIP_A);
+  }, 500);
   sampleBtn2.onPress([](int){
     if (uiMode != MODE_RAM) return;
-
-    if (saveClipMode) {
-      startBounceSave(CLIP_B);
-      saveClipMode = false;
-      return;
-    }
-
-    if (!isRecording && !armedRecord && clipReadyB) {
+    if (!overdubEnabled && !isRecording && !armedRecord && clipReadyB) {
       if (tapBpm > 0.0f && msPerBeat > 0) {
         uint32_t now = millis();
         uint32_t mod = now % msPerBeat;
@@ -1342,13 +1273,24 @@ void setup(){
 
     if (isRecording || armedRecord) stopRecording();
     recordSlot    = CLIP_B;
-    clipSamplesB  = 0;
-    clipReadyB    = false;
+    if (overdubEnabled && clipReadyB) {
+      overdubPosB = 0;
+    } else {
+      clipSamplesB  = 0;
+      clipReadyB    = false;
+      overdubPosB   = 0;
+    }
     startArmedRecord();
     tft.fillRect(0, 96, 128, 12, BLACK);
     tft.setCursor(4, 98); tft.setTextColor(CYAN);
     tft.print("Rec Smp 2");
   });
+  sampleBtn2.onHold([](int){
+    if (uiMode != MODE_RAM) return;
+    if (isRecording || armedRecord) stopRecording();
+    if (isPlaying) stopPlayback();
+    startBounceSave(CLIP_B);
+  }, 500);
 
   recButton.onPress([](int){
     if (uiMode == MODE_RAM) {
@@ -1434,11 +1376,6 @@ void setup(){
     if (uiMode != MODE_RAM) return;
     if (isRecording || armedRecord) stopRecording();
     if (isPlaying) stopPlayback();
-    saveClipMode = true;
-    tft.fillRect(0, 120, 128, 8, BLACK);
-    tft.setCursor(4, 120);
-    tft.setTextColor(YELLOW);
-    tft.print("Hold: Save -> Smp1/A Smp2/B");
   }, 800);
 
   loopButton.onPress([](int){
@@ -1464,12 +1401,36 @@ void setup(){
     }
   });
 
+  overdubButton.onPress([](int){
+    if (uiMode == MODE_RAM) {
+      overdubEnabled = !overdubEnabled;
+      tft.fillRect(0, 96, 128, 12, BLACK);
+      tft.setCursor(4, 98);
+      tft.setTextColor(overdubEnabled ? CYAN : RED);
+      tft.print("Overdub: "); tft.print(overdubEnabled ? "ON " : "OFF");
+    } else if (uiMode == MODE_MENU) {
+      if (!sdfsReady) return;
+      String selName = String(menuItems[menuIndex]);
+      if (selName.endsWith("/")) return;
+      String fullPath = currentPath + selName;
+      if (sdfs.exists(fullPath.c_str())) {
+        bool removed = sdfs.remove(fullPath.c_str());
+        tft.fillRect(0, 120, 128, 8, BLACK);
+        tft.setCursor(4, 120);
+        tft.setTextColor(removed ? RED : YELLOW);
+        tft.print(removed ? "Deleted " : "Delete fail ");
+        tft.print(selName);
+        scanSDMenu(currentPath);
+        drawMenu();
+      }
+    }
+  });
+
   selectButton.onPress([](int){
     uiMode = static_cast<UIMode>((uiMode + 1) % 3);
     isRecording = false;
     isPlaying = false;
     armedRecord = false;
-    saveClipMode = false;
     stopSDRecord();
     stopSDPlay();
     stopPlayback();
@@ -1492,7 +1453,6 @@ void setup(){
     if (uiMode == MODE_SDREC) {
       tft.setTextColor(GREEN); tft.print("SD Rec: ON  ");
     } else if (uiMode == MODE_RAM) {
-      tft.setTextColor(RED); tft.print("SD Rec: OFF ");
     } else if (uiMode == MODE_MENU) {
       tft.setTextColor(CYAN); tft.print("MENU MODE   ");
       scanSDMenu(currentPath);
@@ -1526,6 +1486,8 @@ void setup(){
   mix.gain(0, 1.0f);
   mix.gain(1, 0.8f);
   mix.gain(2, 0.0f);
+  outMix.gain(0, 1.0f);
+  outMix.gain(1, reverbDepth);
   reverb.roomsize(0.25f);
   reverb.damping(0.50f);
 
@@ -1562,11 +1524,6 @@ void loop(){
         if (menuIndex >= menuLength) menuIndex = 0;
         drawMenu();
       }
-    } else if (uiMode == MODE_EFFECTS_MENU) {
-      effectsMenuIndex += encDelta;
-      if (effectsMenuIndex < 0) effectsMenuIndex = FX_COUNT - 1;
-      if (effectsMenuIndex >= FX_COUNT) effectsMenuIndex = 0;
-      drawEffectsMenu();
     } else if (uiMode == MODE_SDREC) {
       sdRecMaxBlocks += encDelta * 500;
       if (sdRecMaxBlocks < 100) sdRecMaxBlocks = 100;
@@ -1652,89 +1609,13 @@ void loop(){
     if (!((playFromSD && sdPlaying) || sdPolyPlaying)) return;
   }
   if (sdPolyPlaying) {
+    // Keep SD poly routed even if other states tweak the mixer
     polyMix.gain(0, 1.0f);
     polyMix.gain(1, 1.0f);
     mix.gain(0, overdubEnabled ? 1.0f : 0.0f);
     mix.gain(1, 0.0f);
     mix.gain(2, 1.0f);
   }
-  if (uiMode == MODE_EFFECTS_MENU) {
-    static int lastEffectsMenuIndex = -1;
-    static bool lastEffectsMenuScreen = false;
-    static bool lastFXEnabled[FX_COUNT] = {false, false, false};
-    static float lastFXDepth[FX_COUNT] = {0.0f, 0.0f, 0.0f};
-    bool shouldRedraw = false;
-    if (lastEffectsMenuIndex != effectsMenuIndex || !lastEffectsMenuScreen) {
-      shouldRedraw = true;
-    }
-    for (int fxIdx = 0; fxIdx < FX_COUNT; ++fxIdx) {
-      if (lastFXEnabled[fxIdx] != sdPlayFXEnabled[fxIdx] || lastFXDepth[fxIdx] != sdPlayFXDepth[fxIdx]) {
-        shouldRedraw = true;
-        break;
-      }
-    }
-  float fxPotVal = readPotInv(POT_FX);
-    static float lastFxPotVal = -1.0f;
-    if (fabs(fxPotVal - lastFxPotVal) > 0.01f) {
-      tft.fillRect(64, 24, 64, 104, BLACK);
-      sdPlayFXDepth[effectsMenuIndex] = fxPotVal;
-      applyEffectsNow();
-      switch (effectsMenuIndex) {
-        case FX_REVERB: {
-          int knobCenterX = 64 + 32, knobCenterY = 60, knobRadius = 20;
-          tft.drawCircle(knobCenterX, knobCenterY, knobRadius, GRAY);
-          float angle = 3.14159f * (0.75f + 1.5f * fxPotVal);
-          int knobHandleX = knobCenterX + (int)(knobRadius * cos(angle));
-          int knobHandleY = knobCenterY + (int)(knobRadius * sin(angle));
-          tft.drawLine(knobCenterX, knobCenterY, knobHandleX, knobHandleY, CYAN);
-          tft.setTextColor(CYAN); tft.setCursor(knobCenterX-20, knobCenterY+36);
-      tft.print("Depth: "); tft.print(fxPotVal,2);
-          break;
-        }
-        case FX_BITCRUSH: {
-          int bars = 8 + (int)(fxPotVal * 8.0f);
-          int barX = 68, barY = 40;
-          for (int barIdx = 0; barIdx < 16; ++barIdx) {
-            int barHeight = 4 + barIdx;
-            uint16_t col = (barIdx < bars) ? CYAN : GRAY;
-            tft.fillRect(barX + barIdx*3, barY + 32 - barHeight, 2, barHeight, col);
-          }
-          tft.setTextColor(CYAN); tft.setCursor(barX, barY+48);
-      tft.print("Bits: "); tft.print(bars);
-          break;
-        }
-        case FX_LOWPASS: {
-          int curveBaseY = 90, curveWidth = 56, curveHeight = 24;
-          float cutoff = 12000.0f - fxPotVal * (12000.0f - 500.0f);
-          for (int curveX = 0; curveX < curveWidth; ++curveX) {
-            float freq = 500.0f + (curveX/(float)curveWidth)*(12000.0f-500.0f);
-            float curveY = curveHeight * exp(-freq/cutoff);
-            tft.drawPixel(64 + curveX, curveBaseY - (int)curveY, CYAN);
-          }
-          tft.setTextColor(CYAN); tft.setCursor(66, curveBaseY+16);
-          tft.print("Cutoff: "); tft.print((int)cutoff);
-          break;
-        }
-        default: break;
-      }
-      lastFxPotVal = fxPotVal;
-    }
-    if (shouldRedraw) {
-      drawEffectsMenu();
-      lastEffectsMenuIndex = effectsMenuIndex;
-      lastEffectsMenuScreen = true;
-      for (int fxIdx = 0; fxIdx < FX_COUNT; ++fxIdx) {
-        lastFXEnabled[fxIdx] = sdPlayFXEnabled[fxIdx];
-        lastFXDepth[fxIdx] = sdPlayFXDepth[fxIdx];
-      }
-      lastFxPotVal = fxPotVal;
-    }
-    encoderBtn.process();
-    playButton.process();
-    loopButton.process();
-    return;
-  }
-
   float clipVolA = readPotInv(PIN_FX1_POT);
   float clipVolB = readPotInv(PIN_FX2_POT);
   float fxReverbVal   = readPotInv(PIN_SMPVOL1_POT);
@@ -1808,29 +1689,26 @@ void loop(){
   sgtl5000.volume(constrain(masterVolume, 0.0f, 1.0f));
   if (!isSDRecording) {
     static elapsedMillis uiTick = 0;
-    if (uiTick > 50){
-      bool allowDraw = !(uiMode == MODE_RAM && isPlaying);
-      if (allowDraw) {
-        if (uiMode == MODE_RAM) {
-          drawFX(clipGainA, clipGainB, masterVolume);
-        }
-        if (isPlaying && blocksRecorded > 0) {
-          int peak = 0;
-          if (loopPlayIndex < blocksRecorded) {
-            for (int i = 0; i < BLOCK_SAMPLES; ++i) {
-              int val = abs(loopBuffer[loopPlayIndex][i]);
-              if (val > peak) peak = val;
-            }
+    if (uiTick > 150){
+      if (uiMode == MODE_RAM) {
+        drawFX(clipGainA, clipGainB, masterVolume);
+      }
+      if (isPlaying && blocksRecorded > 0) {
+        int peak = 0;
+        if (loopPlayIndex < blocksRecorded) {
+          for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+            int val = abs(loopBuffer[loopPlayIndex][i]);
+            if (val > peak) peak = val;
           }
-          float normPeak = (float)peak / 32768.0f;
-          drawMeter(normPeak);
-        } else if (peakL.available()) {
-          drawMeter(peakL.read());
         }
-        if (countsDirty) {
-          drawCounts(blocksRecorded);
-          countsDirty = false;
-        }
+        float normPeak = (float)peak / 32768.0f;
+        drawMeter(normPeak);
+      } else if (peakL.available()) {
+        drawMeter(peakL.read());
+      }
+      if (countsDirty) {
+        drawCounts(blocksRecorded);
+        countsDirty = false;
       }
       uiTick = 0;
     }
@@ -1850,17 +1728,43 @@ void loop(){
 
       if (isRecording) {
         if (recordSlot == CLIP_A) {
-          uint32_t remaining = (clipSamplesA + BLOCK_SAMPLES <= MAX_CLIP_SAMPLES) ? BLOCK_SAMPLES : (MAX_CLIP_SAMPLES - clipSamplesA);
+          bool overdubActive = overdubEnabled && clipReadyA;
+          uint32_t writePos = overdubActive ? overdubPosA : clipSamplesA;
+          uint32_t existingLen = clipSamplesA;
+          uint32_t remaining = (writePos + BLOCK_SAMPLES <= MAX_CLIP_SAMPLES) ? BLOCK_SAMPLES : (MAX_CLIP_SAMPLES - writePos);
           if (remaining > 0) {
-            memcpy(clipA + clipSamplesA, b, remaining * sizeof(int16_t));
-            clipSamplesA += remaining;
+            for (uint32_t i = 0; i < remaining; ++i) {
+              uint32_t idx = writePos + i;
+              int32_t in = b[i];
+              int32_t existing = (overdubActive && idx < existingLen) ? clipA[idx] : 0;
+              int32_t mixed = overdubActive ? (int32_t)(existing * odFeedback + in * odInputGain) : in;
+              if (mixed > 32767) mixed = 32767;
+              else if (mixed < -32768) mixed = -32768;
+              clipA[idx] = (int16_t)mixed;
+            }
+            writePos += remaining;
+            clipSamplesA = overdubActive ? max(existingLen, writePos) : (clipSamplesA + remaining);
+            overdubPosA = overdubActive ? writePos : overdubPosA;
           }
           if (clipSamplesA >= MAX_CLIP_SAMPLES) { stopRecording(); }
         } else if (recordSlot == CLIP_B) {
-          uint32_t remaining = (clipSamplesB + BLOCK_SAMPLES <= MAX_CLIP_SAMPLES) ? BLOCK_SAMPLES : (MAX_CLIP_SAMPLES - clipSamplesB);
+          bool overdubActive = overdubEnabled && clipReadyB;
+          uint32_t writePos = overdubActive ? overdubPosB : clipSamplesB;
+          uint32_t existingLen = clipSamplesB;
+          uint32_t remaining = (writePos + BLOCK_SAMPLES <= MAX_CLIP_SAMPLES) ? BLOCK_SAMPLES : (MAX_CLIP_SAMPLES - writePos);
           if (remaining > 0) {
-            memcpy(clipB + clipSamplesB, b, remaining * sizeof(int16_t));
-            clipSamplesB += remaining;
+            for (uint32_t i = 0; i < remaining; ++i) {
+              uint32_t idx = writePos + i;
+              int32_t in = b[i];
+              int32_t existing = (overdubActive && idx < existingLen) ? clipB[idx] : 0;
+              int32_t mixed = overdubActive ? (int32_t)(existing * odFeedback + in * odInputGain) : in;
+              if (mixed > 32767) mixed = 32767;
+              else if (mixed < -32768) mixed = -32768;
+              clipB[idx] = (int16_t)mixed;
+            }
+            writePos += remaining;
+            clipSamplesB = overdubActive ? max(existingLen, writePos) : (clipSamplesB + remaining);
+            overdubPosB = overdubActive ? writePos : overdubPosB;
           }
           if (clipSamplesB >= MAX_CLIP_SAMPLES) { stopRecording(); }
         }
@@ -1889,7 +1793,7 @@ void loop(){
         float mixedSample = 0.0f;
 
         if (playingClipA) {
-          if (loopModeEnabled && clipReadyA && clipSamplesA > 0 && clipPlayPosA >= clipSamplesA) {
+          if (loopModeEnabled && !bounceActive && clipReadyA && clipSamplesA > 0 && clipPlayPosA >= clipSamplesA) {
             clipPlayPosA -= clipSamplesA;
           }
           if (clipPlayPosA < clipSamplesA) {
@@ -1913,7 +1817,7 @@ void loop(){
         }
 
         if (playingClipB) {
-          if (loopModeEnabled && clipReadyB && clipSamplesB > 0 && clipPlayPosB >= clipSamplesB) {
+          if (loopModeEnabled && !bounceActive && clipReadyB && clipSamplesB > 0 && clipPlayPosB >= clipSamplesB) {
             clipPlayPosB -= clipSamplesB;
           }
           if (clipPlayPosB < clipSamplesB) {
